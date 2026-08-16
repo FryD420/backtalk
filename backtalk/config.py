@@ -1,0 +1,147 @@
+"""Configuration — backtalk.json in the repo root, merged over defaults.
+
+backtalk deliberately owns NO personality. Your agent's identity lives in
+the CLAUDE.md of whatever folder `agent_dir` points at — backtalk just
+gives that agent a mouth and ears. The only voice-related instruction it
+adds is the spoken-delivery discipline below, which is about the MEDIUM
+(writing for the ear), never the character.
+"""
+import json
+import os
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+CONFIG_PATH = REPO / "backtalk.json"
+
+DEFAULTS = {
+    # The folder whose CLAUDE.md defines WHO your agent is. The voice
+    # session runs there, so it's the same assistant as your terminal
+    # sessions — same name, same personality, same memory.
+    "agent_dir": "~",
+    # Display name, used in logs and to build the quit phrases
+    # ("goodbye <name>" hangs up). Match your agent's actual name.
+    "name": "Assistant",
+    # The brain. Full model id ON PURPOSE — never a bare alias like
+    # "sonnet": the SDK resolves aliases through its own bundled CLI and
+    # can silently land on an older model. The fast tier is most of the
+    # speed difference people ask about; a deep-work model makes every
+    # reply noticeably slower and burns usage doing it.
+    "model": "claude-sonnet-5",
+    # Tool permissions for the voice session. "bypassPermissions" = the
+    # agent uses its tools freely, exactly like your terminal session
+    # but WITHOUT approval prompts — a voice session has no good way to
+    # show one, and a stalled prompt reads as the AI going mute
+    # mid-sentence. Set "default" if you'd rather approve in the
+    # terminal and don't mind the stalls.
+    "permission_mode": "bypassPermissions",
+    # Extra folders the agent may access beyond agent_dir (e.g. your
+    # notes vault). Absolute paths or ~ paths.
+    "extra_dirs": [],
+    # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
+    # or a single character.
+    "ptt_key": "home",
+    # The voice (Kokoro, local, free). bm_lewis is the proven default —
+    # British male, the butler register. Others: bm_george, bm_daniel,
+    # bm_fable, am_michael, af_heart... The first letter picks the
+    # language pipeline (a=American, b=British, e/f/h/i/j/p/z = other
+    # languages), so keep voice and accent matched.
+    "voice": "bm_lewis",
+    # Speech recognition (faster-whisper, local, free).
+    # Models: tiny.en / base.en / small.en / medium.en — small.en is the
+    # accuracy/speed sweet spot on a normal machine.
+    "stt_model": "small.en",
+    # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
+    "stt_device": "auto",
+    "stt_compute": "int8",
+    # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
+    # goes in a file: it's read from the macOS Keychain (item
+    # `backtalk-elevenlabs`) or Linux secret-tool, with the
+    # ELEVENLABS_API_KEY env var as last-resort fallback — see
+    # mouth._get_elevenlabs_key for the seeding one-liners. Kokoro
+    # remains the automatic fallback, so the voice degrades instead of
+    # going mute if the cloud fails. Needs ffmpeg on the PATH.
+    "elevenlabs": {
+        "enabled": False,
+        "voice_id": "",
+        "model": "eleven_turbo_v2_5",
+        # Local mastering: ElevenLabs' site previews are mastered demo
+        # clips and the raw API never matches them. This chain closes
+        # the gap: presence lift, light chest, broadcast compression,
+        # limiter. atempo is the one pace dial (1.0 = native).
+        "master": ("atempo=1.12,highpass=f=70,"
+                   "equalizer=f=3200:t=q:w=1.2:g=3.5,"
+                   "equalizer=f=140:t=q:w=1:g=1.5,"
+                   "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
+                   "release=120:makeup=4dB,alimiter=limit=0.95"),
+    },
+    # Where the signal-bus files are written (.voice_state,
+    # .voice_waveform, .voice_loading_pid) — anything can watch them;
+    # visualizers pair with this contract. Default: the repo root.
+    "signals_dir": "",
+    # THE BAREHANDS SEAM: point this at a barehands checkout's state/
+    # folder and its on-screen ring becomes your agent's face — it
+    # breathes while idle, spins while thinking, pulses with the voice.
+    # (github.com/jaredrhod/barehands)
+    "barehands_state_dir": "",
+    # Optional sound played while the agent thinks (path to a wav/mp3).
+    "thinking_sound": "",
+    # Spoken lines. {name} is replaced with "name" above.
+    "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
+    "signoff": "Voice line closing. I'll be here when you need me.",
+}
+
+# The spoken-delivery discipline — the MEDIUM half of what used to be a
+# persona. The CHARACTER half deliberately is not here: it's whatever
+# lives in the agent_dir's CLAUDE.md. One identity, one place.
+DISCIPLINE = (
+    "VOICE SESSION (your reply is spoken aloud through a TTS engine, "
+    "not displayed): you are SPEAKING, in your own voice and "
+    "personality — your CLAUDE.md is who you are. The TTS engine "
+    "PERFORMS your punctuation, so write like a performance, never "
+    "like a memo: contractions always, punchy conversational "
+    "sentences, and if a line could open a quarterly report, rewrite "
+    "it like you're telling a friend. Keep replies to a few short "
+    "sentences; go longer only when the question genuinely needs it. "
+    "No markdown, no lists, no code blocks, no emoji, no URLs. Say "
+    "numbers the way a human says them out loud — never raw figures "
+    "or symbols. Skip any startup sequence; answer directly."
+)
+
+
+def _expand(p: str) -> str:
+    return os.path.expanduser(p) if p else p
+
+
+def load() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))          # deep copy
+    try:
+        user = json.loads(CONFIG_PATH.read_text())
+        for k, v in user.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    except FileNotFoundError:
+        pass
+    except ValueError as e:
+        print(f"[config] backtalk.json is not valid JSON ({e}) — "
+              f"using defaults", flush=True)
+    cfg["agent_dir"] = _expand(cfg["agent_dir"])
+    cfg["extra_dirs"] = [_expand(d) for d in cfg.get("extra_dirs", [])]
+    cfg["signals_dir"] = _expand(cfg.get("signals_dir", "")) or str(REPO)
+    cfg["barehands_state_dir"] = _expand(cfg.get("barehands_state_dir", ""))
+    cfg["thinking_sound"] = _expand(cfg.get("thinking_sound", ""))
+    name = str(cfg.get("name") or "Assistant")
+    low = name.lower()
+    cfg["quit_phrases"] = tuple(cfg.get("quit_phrases") or (
+        f"goodbye {low}", f"good bye {low}", "end voice mode",
+        f"hang up {low}", "hang up"))
+    key_label = "the " + str(cfg.get("ptt_key", "home")).replace("_", " ") \
+                + " key"
+    cfg["greeting"] = str(cfg["greeting"]).replace(
+        "{name}", name).replace("{ptt_key}", key_label)
+    cfg["signoff"] = str(cfg["signoff"]).replace("{name}", name)
+    return cfg
+
+
+CFG = load()
