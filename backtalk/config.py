@@ -83,8 +83,10 @@ DEFAULTS = {
     # breathes while idle, spins while thinking, pulses with the voice.
     # (github.com/jaredrhod/barehands)
     "barehands_state_dir": "",
-    # Optional sound played while the agent thinks (path to a wav/mp3).
-    "thinking_sound": "",
+    # Sound played while the agent thinks, so a long pause never reads as
+    # a dead line. The bundled one ships in assets/; a relative path
+    # resolves against this repo. Set "" to think in silence.
+    "thinking_sound": "assets/thinking.wav",
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
     "signoff": "Voice line closing. I'll be here when you need me.",
@@ -130,7 +132,10 @@ def load() -> dict:
     cfg["extra_dirs"] = [_expand(d) for d in cfg.get("extra_dirs", [])]
     cfg["signals_dir"] = _expand(cfg.get("signals_dir", "")) or str(REPO)
     cfg["barehands_state_dir"] = _expand(cfg.get("barehands_state_dir", ""))
-    cfg["thinking_sound"] = _expand(cfg.get("thinking_sound", ""))
+    thinking = _expand(cfg.get("thinking_sound", ""))
+    if thinking and not os.path.isabs(thinking):
+        thinking = str(REPO / thinking)
+    cfg["thinking_sound"] = thinking
     name = str(cfg.get("name") or "Assistant")
     low = name.lower()
     cfg["quit_phrases"] = tuple(cfg.get("quit_phrases") or (

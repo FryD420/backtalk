@@ -13,6 +13,7 @@ The hearing and the voice run local: free, offline models on your machine, no vo
 - **Interrupt it.** Press the key while it's talking and it shuts up and listens. No headphones needed, because the mic only opens while you hold the key, so it never hears the speakers.
 - **Type instead whenever you want.** Typing in the terminal is the same conversation, and the reply is still spoken.
 - **Music ducks while it speaks** (Spotify, macOS) and comes back up after.
+- **It thinks out loud.** While the agent works, you hear the processing sound from my videos, so a pause never reads as a dead line. Silence it with `"thinking_sound": ""` in the config.
 
 ## Install
 
@@ -46,7 +47,12 @@ The default voice is `bm_lewis`, a British male with exactly the butler register
 
 ## Give it a face (optional)
 
-backtalk writes tiny state files while it listens, thinks, and speaks. It's the same signal-bus contract my visualizer prompts use, so anything can watch them. And if you run [barehands](https://github.com/jaredrhod/barehands), point `barehands_state_dir` at its `state/` folder and the on-screen ring becomes your agent's face: it breathes while idle, spins while thinking, and pulses with the voice while it talks. Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (this), body (barehands).
+backtalk writes tiny state files while it listens, thinks, and speaks, so anything can watch them and react in real time.
+
+- **[ai-visualizer](https://github.com/jaredrhod/ai-visualizer)** is the matching face: five full-screen visualizers, including the living circuit board from my videos. Point its `bus_dir` at this folder (or set `signals_dir` here to its folder) and it performs your actual conversation, idling, listening, thinking, and speaking along with the voice.
+- **[barehands](https://github.com/jaredrhod/barehands)**: point `barehands_state_dir` at its `state/` folder and the on-screen ring becomes your agent's face, breathing while idle, spinning while thinking, and pulsing with the voice while it talks.
+
+Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (this), face (ai-visualizer), hands (barehands).
 
 ## The fine print that matters
 

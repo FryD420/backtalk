@@ -41,10 +41,13 @@ Ask: **"Do you already have a Claude Code agent, a folder with a CLAUDE.md that 
 
 Ask about each, configure what they want:
 
-- **A face:** if they have **barehands** (github.com/jaredrhod/barehands), set `barehands_state_dir` to its `state/` folder path, and the on-screen ring becomes the agent's face, live with the voice. If they don't have it, one sentence: "there's a companion repo that gives it a face on screen, for later if you want."
+- **A face:** two companions read the signal bus this repo writes.
+  - **ai-visualizer** (github.com/jaredrhod/ai-visualizer): five full-screen faces including the circuit board. Either set `signals_dir` here to that repo's folder, or set `bus_dir` there to this folder. One direction, not both.
+  - **barehands** (github.com/jaredrhod/barehands): set `barehands_state_dir` to its `state/` folder path and the on-screen ring becomes the agent's face, live with the voice.
+  If they have neither, one sentence: "there are companion repos that give it a face on screen, for later if you want."
 - **Extra folders:** anything beyond `agent_dir` the agent should reach in voice sessions (a notes vault, a projects folder) goes in `extra_dirs`.
 - **Permissions:** explain the default plainly: the voice session runs with tool approvals bypassed so it works hands-free; `"permission_mode": "default"` restores approval prompts in the terminal at the cost of stalls. Their call. Record it in the config.
-- **A thinking sound:** a wav/mp3 path in `thinking_sound` plays while the agent works. Skippable.
+- **The thinking sound:** on by default, playing `assets/thinking.wav` while the agent works. Point `thinking_sound` at any other wav/mp3 to swap it, or set it to `""` for silence. If they also run ai-visualizer, leave this on and its browser player stays quiet automatically, so the sound never doubles.
 
 ## Phase 5: Test-fire the loop
 
