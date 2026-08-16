@@ -34,6 +34,10 @@ The installer sets up a Python environment, the two local AI models (speech-to-t
 
 Hold the key. Talk. Let go.
 
+## Windows
+
+Windows is the newest lane, and the setup runs through the wizard instead of the shell scripts (`install.sh` and `run.sh` are Mac and Linux). Open this folder in Claude Code and say *"read backtalk.md and set me up"*: the wizard installs uv, espeak-ng, the environment, and the models natively, then launches with `uv run python -m backtalk.main`. The ElevenLabs key lives in the `ELEVENLABS_API_KEY` environment variable on Windows for now (Credential Manager support is planned). Hit something rough? The Windows notes in `TROUBLESHOOTING.md` carry the known quirks, and issues are welcome.
+
 ## The voice
 
 The default voice is `bm_lewis`, a British male with exactly the butler register, from Kokoro, a local open-source TTS. Around 60 voices ship free; set `voice` in `backtalk.json` (the first letter picks the language: `a` is American, `b` is British, and there are Spanish, French, Hindi, Italian, Japanese, Portuguese, and Chinese voices too).

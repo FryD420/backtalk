@@ -54,6 +54,8 @@ def _ensure_espeak():
         "/usr/local/lib/libespeak-ng.dylib",          # macOS intel (brew)
         "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1",  # debian/ubuntu
         "/usr/lib/libespeak-ng.so.1",                 # other linux
+        "C:\\Program Files\\eSpeak NG\\libespeak-ng.dll",       # windows
+        "C:\\Program Files (x86)\\eSpeak NG\\libespeak-ng.dll",
     )
     for lib in candidates:
         if os.path.exists(lib):

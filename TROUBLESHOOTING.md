@@ -16,6 +16,14 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **ElevenLabs sounds worse than their website**: their site previews are mastered demo clips; the raw API never matches them. The shipped `master` ffmpeg chain closes the gap; make sure `ffmpeg` is installed, and don't set the style parameter or switch to the multilingual model for English (both make delivery slow and dull).
 - **It answers my previous question instead of the one I just asked**: this is the interrupt-desync bug this codebase specifically armors against (`brain.reset_turn`); if you EVER see it, something has changed in the SDK. Grab `logs/backtalk.log` and file an issue; the log will show whether the stale-turn drain ran.
 
+## Windows notes
+
+- **No install.sh or run.sh:** they are Mac and Linux shell scripts. The wizard (`backtalk.md`) performs the install natively on Windows; launch with `uv run python -m backtalk.main`.
+- **espeak-ng:** install it with winget or the official installer. backtalk looks for `libespeak-ng.dll` in the usual Program Files locations; if yours lives elsewhere, set `PHONEMIZER_ESPEAK_LIBRARY` to the dll's full path.
+- **The ElevenLabs key** lives in the `ELEVENLABS_API_KEY` environment variable for now; Credential Manager support is planned.
+- **One copy at a time:** run.sh's single-instance guard is Mac and Linux; on Windows, close the old window before starting a new one, or two voices answer one mic.
+- **Speed:** `stt_device: "auto"` uses CUDA when present and CPU otherwise; CPU with `small.en` is plenty fast on a normal machine.
+
 ## The open-mic tradeoff
 
 `--open-mic` listens continuously with voice-activity detection instead of hold-to-talk. Know what you're trading: any speech in the room (a video, music with vocals, another voice assistant) can be transcribed and answered as if it were you. Hold-to-talk is the default because the button is a perfect voice-activity detector and the mic is *closed* the rest of the time. `--barge-in` (interrupting it by talking over it) additionally requires headphones, or it hears its own reply and interrupts itself.
