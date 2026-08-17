@@ -43,6 +43,18 @@ def resolve_key(name: str):
     name = (name or "home").strip().lower()
     if len(name) == 1:
         return keyboard.KeyCode.from_char(name)
+    # Friendly names -> pynput's names. pynput calls the right option key
+    # alt_r, not right_alt; the docs speak human, this map translates.
+    # (Field-caught: right_alt silently fell back to home, which Mac
+    # laptops cannot press, so the voice looked healthy and never fired.)
+    aliases = {
+        "right_alt": "alt_r", "left_alt": "alt_l",
+        "right_option": "alt_r", "left_option": "alt_l",
+        "right_ctrl": "ctrl_r", "left_ctrl": "ctrl_l",
+        "right_cmd": "cmd_r", "left_cmd": "cmd_l",
+        "right_shift": "shift_r", "left_shift": "shift_l",
+    }
+    name = aliases.get(name, name)
     try:
         return getattr(keyboard.Key, name)
     except AttributeError:
