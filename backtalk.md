@@ -28,6 +28,8 @@ Everything runs local by default: free on-device models for both hearing and spe
 
 Ask: **"Do you already have a Claude Code agent, a folder with a CLAUDE.md that defines an assistant (a name, a personality)?"**
 
+Never default `agent_dir` to whatever folder Claude Code happens to be running in: an unrelated project is not an agent, and wiring the voice to one gives the person a voice with no one behind it. If there is no real agent folder, use one of the two paths below.
+
 - **Yes:** get the folder's path. That's `agent_dir`. Ask the agent's name for `name` (it builds the quit phrases, "goodbye <name>" hangs up, and labels the log).
 - **No:** point them at **ai-memory-vault** (github.com/jaredrhod/ai-memory-vault), the full build that creates an agent with persistent memory, and it ships with a ready-made personality (Jarvis) they can keep, rename, or replace. Offer to pause here while they run that first (it's the better order), or set `agent_dir` to a folder of their choice with a minimal CLAUDE.md you write together now (a name, a role, a few lines of personality) as a starter.
 
