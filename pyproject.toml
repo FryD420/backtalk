@@ -2,7 +2,7 @@
 name = "backtalk"
 version = "1.0.0"
 description = "Talk to your Claude Code agent out loud. Hold a key, speak, and it answers in a real voice."
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "claude-agent-sdk>=0.2.100",
     "faster-whisper>=1.0.0",
@@ -15,6 +15,9 @@ dependencies = [
     "soundfile>=0.12.0",
     "webrtcvad>=2.0.10",
 ]
+
+[tool.setuptools]
+packages = ["backtalk"]
 
 [tool.uv]
 package = false
