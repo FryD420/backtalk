@@ -14,9 +14,10 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **Two voices answering at once**: two copies are running. `./run.sh` kills the previous instance on launch; if you started one some other way, kill it. One body, one mouth.
 - **Spotify stays quiet after it stops talking**: the restore is debounced ~0.5s; if the process was force-killed mid-speech the restore can be lost. It self-corrects on the next duck, or nudge the volume by hand.
 - **ElevenLabs sounds worse than their website**: their site previews are mastered demo clips; the raw API never matches them. The shipped `master` ffmpeg chain closes the gap; make sure `ffmpeg` is installed, and don't set the style parameter or switch to the multilingual model for English (both make delivery slow and dull).
-- **It started asking permission out loud after an update**: that is the new default (safe by default, hands-free by choice). Say "go hands free" in a voice session and confirm for an immediate, saved flip; or tell your agent to set `"permission_mode": "bypassPermissions"`, which takes effect the next time the voice line starts. The agent writes the config, never you.
+- **It started asking permission out loud after an update**: that is the new default (safe by default, auto-approve by choice). Say "stop asking for permission" in a voice session and confirm for an immediate, saved flip; or tell your agent to set `"permission_mode": "bypassPermissions"`, which takes effect the next time the voice line starts. The agent writes the config, never you.
 - **It asked permission, then said "no answer, so I didn't do it"**: the spoken ask waits about 75 seconds, then treats silence as no. Hold the key and answer with an exact "yes" (or "go ahead", "approved") to approve; anything else denies and is passed back to the agent as the reason, so spoken redirections work.
-- **A voice command didn't trigger**: console phrases match exactly, spoken alone: "clear the session", "compact the session", "switch to the deep model", "back to the fast model", "set effort to low" (or medium, high, max), "usage report", "go hands free", "start asking again". Extra words around them make a normal sentence for the agent instead. That guard is deliberate.
+- **A voice command didn't trigger**: console phrases match exactly, spoken alone: "clear the session", "compact the session", "switch to the deep model", "back to the fast model", "set effort to low" (or medium, high, max), "usage report", "go hands free" and "push to talk mode" (the microphone), "stop asking for permission" and "start asking again" (approvals). Extra words around them make a normal sentence for the agent instead. That guard is deliberate.
+- **"Hands-free" vs auto-approve, because the words matter**: hands-free is the MICROPHONE (always listening, no button; "go hands free" / "push to talk mode"). Auto-approve is PERMISSIONS (act without asking; "stop asking for permission" / "start asking again"). They are separate settings and switch separately.
 - **It answers my previous question instead of the one I just asked**: this is the interrupt-desync bug this codebase specifically armors against (`brain.reset_turn`); if you EVER see it, something has changed in the SDK. Grab `logs/backtalk.log` and file an issue; the log will show whether the stale-turn drain ran.
 
 ## Windows notes
@@ -27,9 +28,9 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **One copy at a time:** run.sh's single-instance guard is Mac and Linux; on Windows, close the old window before starting a new one, or two voices answer one mic.
 - **Speed:** `stt_device: "auto"` uses CUDA when present and CPU otherwise; CPU with `small.en` is plenty fast on a normal machine.
 
-## The open-mic tradeoff
+## Hands-free listening: the tradeoff
 
-`--open-mic` listens continuously with voice-activity detection instead of hold-to-talk. Know what you're trading: any speech in the room (a video, music with vocals, another voice assistant) can be transcribed and answered as if it were you. Hold-to-talk is the default because the button is a perfect voice-activity detector and the mic is *closed* the rest of the time. `--barge-in` (interrupting it by talking over it) additionally requires headphones, or it hears its own reply and interrupts itself.
+Hands-free listening (the setup question, `"mic_mode": "open"`, the spoken "go hands free", or the `--open-mic` launch flag) listens continuously with voice-activity detection instead of hold-to-talk. Know what you're trading: any speech in the room (a video, music with vocals, another voice assistant) can be transcribed and answered as if it were you. Push to talk is the default because the button is a perfect voice-activity detector and the mic is *closed* the rest of the time. Two things stay true in hands-free: the talk key still works (it interrupts, and holding it always gets you heard over room noise), and spoken permission checks accept only an exact "yes", so stray room audio cannot approve an action. With open speakers, answer permission checks with the button held, or wear headphones. `--barge-in` (interrupting it by talking over it) additionally requires headphones, or it hears its own reply and interrupts itself.
 
 ## For AI assistants: the architecture in six lines
 
@@ -43,9 +44,12 @@ hold key -> ears.record_held (sounddevice, 16kHz int16)
 signals.py mirrors state to .voice_* files (+ optional barehands state/)
 permission_mode "ask": gated tools pause the turn and route to a spoken
                        yes/no (main.make_permission_gate). The LIVE
-                       hands-free switch is a gate flag; a session
-                       BOOTED hands-free is real SDK bypassPermissions
-                       and never consults the gate
+                       auto-approve switch is a gate flag; a session
+                       BOOTED in bypassPermissions is real SDK bypass
+                       and never consults the gate. The mic mode
+                       (_MIC, ptt/open) is a separate axis: one loop,
+                       the open mic joins the wait-set in "open" mode,
+                       and the talk key works in both
 ```
 
 Three land mines with warning signs on them; do not "simplify" these away:
@@ -53,7 +57,8 @@ Three land mines with warning signs on them; do not "simplify" these away:
 1. **The key-repeat filter in `ptt.py`.** The OS fires on_press continuously while a key is held; without the held-state flag, every repeat cancels the reply before it can speak.
 2. **The one long-lived output stream in `mouth.py`.** A fresh stream per sentence causes onset blips or dead air on USB interfaces, Bluetooth, and streaming mixers. Interrupts pad silence into the stream; they never close it.
 3. **`brain.reset_turn` in `brain.py`.** The SDK has one shared message stream with no query/response pairing; an interrupted turn leaves its leftovers buffered, and without the drain every later answer is off by one question.
-4. **The pending-permission routing in `main.py`.** While a spoken permission ask is waiting, the next utterance is the ANSWER: it must never be treated as an interrupt or a new turn, or the paused turn gets cancelled out from under the SDK. The same goes for the live hands-free switch: the CLI refuses a live flip INTO bypassPermissions (it needs the danger flag at launch), which is why hands-free is a gate flag instead of an SDK mode change.
+4. **The pending-permission routing in `main.py`.** While a spoken permission ask is waiting, the next utterance is the ANSWER: it must never be treated as an interrupt or a new turn, or the paused turn gets cancelled out from under the SDK. The same goes for the live auto-approve switch: the CLI refuses a live flip INTO bypassPermissions (it needs the danger flag at launch), which is why auto-approve is a gate flag instead of an SDK mode change.
+5. **The mic generation counter (`_MIC["gen"]`).** A live switch between push-to-talk and hands-free listening bumps it; the open mic's abort callable watches it, and any capture born under an old generation is discarded. Without it, a switch back to push-to-talk leaves an open mic capturing one final utterance that then fires as a ghost turn.
 
 ## Verify a working install
 

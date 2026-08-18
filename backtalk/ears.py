@@ -82,9 +82,13 @@ class Ears:
         self.vad = webrtcvad.Vad(aggressiveness)
         self.silence_frames = silence_ms // FRAME_MS
 
-    def listen_once(self, gate=None, timeout_s: float | None = None) -> str | None:
+    def listen_once(self, gate=None, timeout_s: float | None = None,
+                    abort=None) -> str | None:
         """Block until one utterance completes; return transcript
-        (or None on timeout)."""
+        (or None on timeout). An `abort` callable is checked every
+        frame; returning True closes the mic and returns None, which
+        is how a live switch back to push-to-talk shuts the open mic
+        down promptly instead of after one more utterance."""
         frames: list[np.ndarray] = []
         ring: list[np.ndarray] = []   # pre-roll so the first syllable survives
         speech_run = 0
@@ -98,6 +102,8 @@ class Ears:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
+                if abort and abort():
+                    return None
                 if timeout_s and elapsed > timeout_s and not in_utterance:
                     return None
                 mono = block[:, 0].copy()

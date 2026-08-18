@@ -59,12 +59,14 @@ DEFAULTS = {
     # "no, put it in drafts instead" actually steers it. No answer
     # within 75 seconds means no, out loud. Most read-only work passes
     # without asking; anything that changes things asks.
-    # "bypassPermissions" is fully hands-free: the agent acts without
+    # "bypassPermissions" is AUTO-APPROVE: the agent acts without
     # asking, exactly like a terminal session with approvals off.
-    # Never hand-edit this file to switch: tell your agent to change
-    # it (takes effect next launch), or say "go hands free" (then
-    # "confirm") or "start asking again" inside a voice session for an
-    # immediate flip that also saves. The legacy value "default" now
+    # (Not to be confused with hands-free LISTENING, which is about
+    # the microphone: see mic_mode below.) Never hand-edit this file
+    # to switch: tell your agent to change it (takes effect next
+    # launch), or say "stop asking for permission" (then "confirm")
+    # or "start asking again" inside a voice session for an immediate
+    # flip that also saves. The legacy value "default" now
     # behaves as "ask" (a headless voice session could never render
     # the terminal prompt it promised).
     "permission_mode": "ask",
@@ -74,6 +76,18 @@ DEFAULTS = {
     # Hold-to-talk key. Named keys ("home", "f13", "right_alt", ...)
     # or a single character.
     "ptt_key": "home",
+    # The microphone mode. "ptt" (push to talk, the default and the
+    # recommendation): the mic is closed except while the key is held,
+    # so room audio and your own speakers can never trigger the agent.
+    # "open" (hands-free listening): always listening with voice
+    # detection; a video, music with vocals, or another person in the
+    # room CAN trigger it, and with open speakers it can hear itself
+    # (headphones recommended). The key still works in hands-free
+    # listening: it interrupts, and holding it always gets you heard.
+    # Switch live by voice: "go hands free" / "push to talk mode"
+    # (the switch saves itself here). The --open-mic launch flag
+    # forces "open" for one session.
+    "mic_mode": "ptt",
     # The voice (Kokoro, local, free). bm_lewis is the proven default —
     # British male, the butler register. Others: bm_george, bm_daniel,
     # bm_fable, am_michael, af_heart... The first letter picks the

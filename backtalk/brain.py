@@ -72,7 +72,7 @@ class WarmBrain:
         sdk_mode = "default" if mode == "ask" else mode
         if sdk_mode == "bypassPermissions" and self._can_use_tool \
                 and CanUseToolShadowedWarning:
-            # Deliberate hands-free: the SDK warns that the callback is
+            # Deliberate auto-approve: the SDK warns that the callback is
             # shadowed. That IS the chosen behavior, so boot quietly.
             warnings.filterwarnings("ignore",
                                     category=CanUseToolShadowedWarning)

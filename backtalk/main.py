@@ -29,16 +29,22 @@ THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
 session" / "compact the session" / "switch to the deep model" / "back
 to the fast model" / "set effort to low" (or medium, high, max) /
-"usage report" / "go hands free" / "start asking again". And with
-permission_mode "ask" (the default), gated tool calls ASK OUT LOUD and
-your spoken yes or no decides them; any other answer is passed back to
-the agent as the reason.
+"usage report" / "go hands free" and "push to talk mode" (the MIC) /
+"stop asking for permission" and "start asking again" (permissions,
+called auto-approve, a different axis than the microphone on purpose).
+And with permission_mode "ask" (the default), gated tool calls ASK OUT
+LOUD and your spoken yes or no decides them; any other answer is
+passed back to the agent as the reason.
 
 Flags:
-  --open-mic   always-listening mode (VAD endpointing) instead of
-               hold-to-talk. Know the tradeoff: room audio (a video,
-               music, another voice assistant) can trigger replies to
-               speech never meant for the agent.
+  --open-mic   start in hands-free listening for this session (the
+               config key mic_mode makes it the standing default, and
+               the voice can switch live either way: "go hands free" /
+               "push to talk mode"). Know the tradeoff: room audio (a
+               video, music, another voice assistant) can trigger
+               replies to speech never meant for the agent. The talk
+               key keeps working: it interrupts, and holding it always
+               gets you heard.
   --barge-in   with --open-mic: keep listening WHILE speaking.
                HEADPHONES REQUIRED — with open speakers the mic hears
                the reply and the agent interrupts itself.
@@ -74,8 +80,8 @@ PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0}   # pending ask + when it was posed
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
-# Live hands-free is OUR flag, not an SDK mode flip: the CLI refuses a
-# live switch INTO bypassPermissions unless it was launched with the
+# Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
+# a live switch INTO bypassPermissions unless it was launched with the
 # danger flag, so instead the gate below auto-approves silently while
 # this is on. Same behavior, no reconnect, conversation intact. A
 # session that BOOTS in bypassPermissions never consults the gate at
@@ -83,8 +89,17 @@ _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # direction is allowed) and turns this off. ONLY the explicit
 # bypassPermissions value arms this: any other mode (acceptEdits, plan)
 # passes through to the SDK and keeps the spoken gate for whatever the
-# SDK routes here.
-_HANDSFREE = {"on": False}
+# SDK routes here. (Auto-approve is about PERMISSIONS; hands-free
+# LISTENING is about the microphone: see _MIC below. Two different
+# axes, deliberately never sharing a name.)
+_AUTOAPPROVE = {"on": False}
+# The microphone mode, switchable live by voice. "ptt" = mic closed
+# except while the key is held. "open" = hands-free listening (VAD).
+# The key keeps working in open mode: it interrupts, and holding it
+# always gets you heard. gen bumps on every switch so an in-flight
+# open-mic capture from before the switch gets discarded, never
+# processed.
+_MIC = {"mode": "ptt", "gen": 0, "btn": False}
 
 # Approvals are EXACT matches after normalization, never prefixes:
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
@@ -147,7 +162,7 @@ def make_permission_gate(mouth):
                                   PermissionResultDeny)
 
     async def gate(tool, tool_input, ctx):
-        if _HANDSFREE["on"]:
+        if _AUTOAPPROVE["on"]:
             return PermissionResultAllow(behavior="allow")
         what = _perm_summary(tool, tool_input, ctx)
         loop = asyncio.get_running_loop()
@@ -218,9 +233,13 @@ CONSOLE_VERBS = {
     "fast":      ("switch to the fast model", "use the fast model",
                   "back to the fast model", "slash model fast"),
     "usage":     ("usage report", "slash usage"),
-    "handsfree": ("go hands free", "hands free mode",
-                  "stop asking for permission",
-                  "stop asking permission"),
+    "micopen":   ("go hands free", "hands free mode",
+                  "hands free listening", "open mic", "open the mic"),
+    "micptt":    ("push to talk", "push to talk mode",
+                  "back to push to talk", "back to the button"),
+    "noask":     ("stop asking for permission",
+                  "stop asking permission", "auto approve",
+                  "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
 }
@@ -526,15 +545,19 @@ async def amain():
             pass
 
     CFG_BOOT_MODE = CFG["permission_mode"]
-    _HANDSFREE["on"] = CFG_BOOT_MODE == "bypassPermissions"
+    _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
+    _MIC["mode"] = "open" if (open_mic
+                              or CFG.get("mic_mode") == "open") else "ptt"
     mouth = Mouth()
     ears = Ears()
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth))
 
-    mode = "open-mic" if open_mic else f"push-to-talk ({CFG['ptt_key']})"
+    mode = ("hands-free listening (the talk key still works)"
+            if _MIC["mode"] == "open"
+            else f"push-to-talk ({CFG['ptt_key']})")
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
-        f"model={brain.model} mode={mode} "
+        f"model={brain.model} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
     mouth.say(CFG["greeting"])
 
@@ -595,23 +618,49 @@ async def amain():
             resp = ""
             mouth.say(_spoken_usage(brain.session,
                                     await brain.context_usage()))
-        elif verb == "handsfree":
+        elif verb == "micopen":
             resp = ""
-            _CONFIRM["verb"] = "handsfree"
+            if _MIC["mode"] == "open":
+                mouth.say("Already in hands-free listening.")
+            else:
+                _MIC["mode"] = "open"
+                _MIC["gen"] += 1
+                _write_config_key("mic_mode", "open")
+                log("[console] mic_mode -> open (hands-free listening)")
+                mouth.say("Hands-free listening on. I'm always "
+                          "listening now, so anything said in the room "
+                          "can reach me. The talk key still works, and "
+                          "holding it always gets you heard. Say push "
+                          "to talk mode to bring the button back.")
+        elif verb == "micptt":
+            resp = ""
+            if _MIC["mode"] == "ptt":
+                mouth.say("Already on push to talk.")
+            else:
+                _MIC["mode"] = "ptt"
+                _MIC["gen"] += 1
+                _write_config_key("mic_mode", "ptt")
+                log("[console] mic_mode -> ptt")
+                key = str(CFG.get("ptt_key", "home")).replace("_", " ")
+                mouth.say(f"Push to talk. Hold the {key} key and "
+                          "talk; the mic stays closed otherwise.")
+        elif verb == "noask":
+            resp = ""
+            _CONFIRM["verb"] = "noask"
             _CONFIRM["at"] = time.monotonic()
-            mouth.say("Hands-free means I act without asking "
+            mouth.say("Auto-approve means I act without asking "
                       "permission, and it becomes your saved default. "
                       "Say confirm to switch.")
-        elif verb == "handsfree:confirmed":
+        elif verb == "noask:confirmed":
             resp = ""
             saved = _write_config_key("permission_mode",
                                       "bypassPermissions")
-            _HANDSFREE["on"] = True
+            _AUTOAPPROVE["on"] = True
             log("[console] permission_mode -> bypassPermissions"
                 + (" (saved)" if saved else " (session only)"))
-            mouth.say(("Hands-free on, and saved as your default. "
+            mouth.say(("Auto-approve on, and saved as your default. "
                        if saved else
-                       "Hands-free on for this session. The config "
+                       "Auto-approve on for this session. The config "
                        "file couldn't be written, so it won't stick "
                        "past a restart. ")
                       + "Say start asking again any time to flip it "
@@ -619,7 +668,7 @@ async def amain():
         elif verb == "ask":
             resp = ""
             saved = _write_config_key("permission_mode", "ask")
-            _HANDSFREE["on"] = False
+            _AUTOAPPROVE["on"] = False
             flipped = True
             if CFG_BOOT_MODE == "bypassPermissions":
                 # a bypass-booted session never consults the gate, so
@@ -683,7 +732,7 @@ async def amain():
                 return True
             else:
                 _deny_pending()
-        # A pending hands-free confirm owns it too, for two minutes;
+        # A pending auto-approve confirm owns it too, for two minutes;
         # after that it expires and speech flows normally again.
         verb = None
         if _CONFIRM["verb"]:
@@ -738,47 +787,59 @@ async def amain():
         return True
 
     try:
-        if open_mic:
-            gate = None if barge_in else (lambda: mouth.speaking)
-            mic_fut: asyncio.Future | None = None
-            while True:
+        # ONE loop, two mic modes, switchable live (_MIC). The talk key
+        # is constructed and honored in BOTH modes: in hands-free
+        # listening it is the interrupt and the guaranteed way to be
+        # heard over room noise. The open mic joins the wait-set only
+        # in "open" mode; a mode switch bumps _MIC["gen"], the abort
+        # callable closes the in-flight open mic promptly, and any
+        # capture born under an old gen is discarded unprocessed.
+        ptt = PTTListener(CFG["ptt_key"])
+        press_fut: asyncio.Future | None = None
+        mic_fut: asyncio.Future | None = None
+        mic_gen_seen = _MIC["gen"]
+        # The open mic yields while the BUTTON records (or the double
+        # capture would turn one held utterance into two turns), and,
+        # without barge-in, while the mouth speaks.
+        mic_gate = (lambda: _MIC["btn"]
+                    or (not barge_in and mouth.speaking))
+        while True:
+            if _MIC["gen"] != mic_gen_seen:
+                mic_gen_seen = _MIC["gen"]
+                # consume futures that completed under the old mode so
+                # a stale press or capture can't fire after a switch
+                if press_fut is not None and press_fut.done():
+                    press_fut.result(); press_fut = None
+                if mic_fut is not None and mic_fut.done():
+                    mic_fut.result(); mic_fut = None
+            if typed_fut is None:
+                typed_fut = loop.run_in_executor(None, typed_q.get)
+            if press_fut is None:
+                press_fut = loop.run_in_executor(None, ptt.wait_press)
+            waiters = {press_fut, typed_fut}
+            if _MIC["mode"] == "open":
                 if mic_fut is None:
+                    g = _MIC["gen"]
                     mic_fut = loop.run_in_executor(
-                        None, lambda: ears.listen_once(gate=gate))
-                if typed_fut is None:
-                    typed_fut = loop.run_in_executor(None, typed_q.get)
-                done, _ = await asyncio.wait(
-                    {mic_fut, typed_fut},
-                    return_when=asyncio.FIRST_COMPLETED)
-                if typed_fut in done:
-                    text = typed_fut.result(); typed_fut = None
-                    if text and not await handle(text):
-                        return
-                    continue
-                text = mic_fut.result(); mic_fut = None
+                        None, lambda g=g: (g, ears.listen_once(
+                            gate=mic_gate,
+                            abort=lambda: _MIC["gen"] != g)))
+                waiters.add(mic_fut)
+            done, _ = await asyncio.wait(
+                waiters, return_when=asyncio.FIRST_COMPLETED)
+            if typed_fut in done:
+                text = typed_fut.result(); typed_fut = None
                 if text and not await handle(text):
                     return
-        else:
-            # HOLD-TO-TALK (the default): hold the key -> duck + open
-            # mic; release -> close mic + restore + process. The button
-            # is the VAD. The mic is CLOSED otherwise (room audio and
-            # music can't leak into the transcriber), and pressing while
-            # the agent talks interrupts it.
-            ptt = PTTListener(CFG["ptt_key"])
-            press_fut: asyncio.Future | None = None
-            while True:
-                if press_fut is None:
-                    press_fut = loop.run_in_executor(None, ptt.wait_press)
-                if typed_fut is None:
-                    typed_fut = loop.run_in_executor(None, typed_q.get)
-                done, _ = await asyncio.wait(
-                    {press_fut, typed_fut},
-                    return_when=asyncio.FIRST_COMPLETED)
-                if typed_fut in done:
-                    text = typed_fut.result(); typed_fut = None
-                    if not await handle(text):
-                        return
-                    continue
+                continue
+            if mic_fut is not None and mic_fut in done:
+                g, text = mic_fut.result(); mic_fut = None
+                if g != _MIC["gen"]:
+                    continue             # captured before a switch
+                if text and not await handle(text):
+                    return
+                continue
+            if press_fut in done:
                 press_fut.result(); press_fut = None
                 press_t = time.monotonic()
                 perm_wait = (_PERM["fut"] is not None
@@ -793,8 +854,12 @@ async def amain():
                 signals.set_state("listening")
                 mouth.ducker.speech_start()      # duck NOW, while you talk
                 print("[ptt] recording (release to send)...", flush=True)
-                text = await loop.run_in_executor(
-                    None, lambda: record_held(ptt.is_held))
+                _MIC["btn"] = True               # open mic yields to the button
+                try:
+                    text = await loop.run_in_executor(
+                        None, lambda: record_held(ptt.is_held))
+                finally:
+                    _MIC["btn"] = False
                 mouth.ducker.speech_end(0.2)     # snap back fast on release
                 if not text:
                     log("[ptt] (tap or empty — ignored)")
@@ -805,6 +870,7 @@ async def amain():
     except KeyboardInterrupt:
         pass
     finally:
+        _MIC["gen"] += 1     # abort any live open-mic capture promptly
         if speak_task and not speak_task.done():
             speak_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
