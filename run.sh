@@ -19,7 +19,7 @@
 # backtalk entrypoint — start a spoken conversation with your agent.
 # Terminal-invoked (inherits the terminal's mic permission). Ctrl-C hangs up.
 cd "$(dirname "$0")"
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 # Single-instance guard: a stale voice session left in a background
 # terminal answers the same mic alongside a fresh launch = two voices at
 # once, and it sounds haunted. One body, one mouth.

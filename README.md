@@ -51,7 +51,7 @@ The default voice is `bm_lewis`, a British male with exactly the butler register
 
 backtalk writes tiny state files while it listens, thinks, and speaks, so anything can watch them and react in real time.
 
-- **[ai-visualizer](https://github.com/jaredrhod/ai-visualizer)** is the matching face: five full-screen visualizers, including the living circuit board from my videos. Point its `bus_dir` at this folder (or set `signals_dir` here to its folder) and it performs your actual conversation, idling, listening, thinking, and speaking along with the voice.
+- **[ai-visualizer](https://github.com/jaredrhod/ai-visualizer)** is the matching face: four full-screen visualizers, including the living circuit board from my videos. Point its `bus_dir` at this folder (or set `signals_dir` here to its folder) and it performs your actual conversation, idling, listening, thinking, and speaking along with the voice.
 - **[barehands](https://github.com/jaredrhod/barehands)**: point `barehands_state_dir` at its `state/` folder and the on-screen ring becomes your agent's face, breathing while idle, spinning while thinking, and pulsing with the voice while it talks.
 
 Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (this), face (ai-visualizer), hands (barehands).
