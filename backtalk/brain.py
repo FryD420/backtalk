@@ -30,8 +30,14 @@ never the character.
 """
 import asyncio
 import re
+import warnings
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+try:
+    from claude_agent_sdk import CanUseToolShadowedWarning
+except ImportError:                       # older SDKs: nothing to silence
+    CanUseToolShadowedWarning = None
 
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
@@ -40,31 +46,113 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
 class WarmBrain:
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, can_use_tool=None):
         # Full model id ON PURPOSE — never a bare alias. The SDK
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
         self.model = model or CFG["model"]
+        # The spoken permission gate (main.py builds it). Wired at
+        # connect in EVERY mode, so a live mode flip needs no reconnect;
+        # bypass simply never consults it.
+        self._can_use_tool = can_use_tool
+        # Session usage, spoken on request ("usage report").
+        self.session = {"turns": 0, "out_tokens": 0, "in_tokens": 0,
+                        "cost": 0.0}
         self._client: ClaudeSDKClient | None = None
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
 
     async def start(self):
+        mode = CFG["permission_mode"]
+        if mode == "default":
+            mode = "ask"     # legacy alias, see config.py
+        # backtalk's "ask" = the SDK's "default" mode with gated calls
+        # routed to the spoken can_use_tool gate.
+        sdk_mode = "default" if mode == "ask" else mode
+        if sdk_mode == "bypassPermissions" and self._can_use_tool \
+                and CanUseToolShadowedWarning:
+            # Deliberate hands-free: the SDK warns that the callback is
+            # shadowed. That IS the chosen behavior, so boot quietly.
+            warnings.filterwarnings("ignore",
+                                    category=CanUseToolShadowedWarning)
         opts = ClaudeAgentOptions(
             cwd=CFG["agent_dir"],
             model=self.model,
             system_prompt={"type": "preset", "preset": "claude_code",
                            "append": DISCIPLINE},
             include_partial_messages=True,
-            # See config.py: a voice session has no good way to show a
-            # permission prompt, and a stalled prompt reads as the AI
-            # going mute mid-sentence. Configurable; documented loudly.
-            permission_mode=CFG["permission_mode"],
+            permission_mode=sdk_mode,
+            can_use_tool=self._can_use_tool,
             add_dirs=CFG["extra_dirs"],
         )
         self._client = ClaudeSDKClient(options=opts)
         await self._client.connect()
+
+    async def set_permission_mode(self, backtalk_mode: str):
+        """Live flip, no reconnect, conversation intact ("ask" maps to
+        the SDK's "default", whose gated calls hit the spoken gate)."""
+        if self._client:
+            sdk_mode = "default" if backtalk_mode == "ask" \
+                else backtalk_mode
+            await self._client.set_permission_mode(sdk_mode)
+
+    async def context_usage(self):
+        """The CLI's own context-window breakdown, or None."""
+        try:
+            return await self._client.get_context_usage()
+        except Exception:
+            return None
+
+    def _tally(self, rm, count_turn=True):
+        """Session usage bookkeeping. Must never break a turn."""
+        try:
+            u = getattr(rm, "usage", None) or {}
+            s = self.session
+            if count_turn:
+                s["turns"] += 1
+            s["out_tokens"] += int(u.get("output_tokens") or 0)
+            s["in_tokens"] += (int(u.get("input_tokens") or 0)
+                               + int(u.get("cache_read_input_tokens")
+                                     or 0))
+            c = getattr(rm, "total_cost_usd", None)
+            if c:
+                s["cost"] += float(c)
+        except Exception:
+            pass
+
+    async def command(self, cmd: str) -> str:
+        """Run a console slash command (/clear, /compact, /model,
+        /effort) through the normal stream and return whatever text the
+        CLI answered with (confirmations, errors). Slash-command replies
+        arrive as COMPLETE AssistantMessages, not stream deltas, so
+        ask_stream cannot see them. Bounded like reset_turn is: this
+        stream is not trusted to always deliver, and an unbounded await
+        here would deafen the whole voice loop. On timeout the pipe is
+        left marked dirty so the next reset_turn drains or rebuilds."""
+        self._dirty = True
+        await self._client.query(cmd)
+        texts = []
+
+        async def _collect():
+            async for msg in self._client.receive_response():
+                t = type(msg).__name__
+                if t == "AssistantMessage":
+                    for b in getattr(msg, "content", []) or []:
+                        txt = getattr(b, "text", None)
+                        if txt:
+                            texts.append(txt)
+                elif t == "ResultMessage":
+                    self._dirty = False
+                    self._tally(msg, count_turn=False)
+                    break
+
+        try:
+            await asyncio.wait_for(_collect(), 90)
+        except asyncio.TimeoutError:
+            log(f"[brain] console command timed out: {cmd!r}")
+            return "error: the command timed out"
+        return " ".join(texts).strip()
 
     async def interrupt(self):
         if self._client:
@@ -159,6 +247,7 @@ class WarmBrain:
                         yield tail
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
+                self._tally(msg)
                 break
         tail = buf.strip()
         if tail:

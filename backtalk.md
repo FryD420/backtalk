@@ -48,7 +48,7 @@ Ask about each, configure what they want:
   - **barehands** (github.com/jaredrhod/barehands): set `barehands_state_dir` to its `state/` folder path and the on-screen ring becomes the agent's face, live with the voice.
   If they have neither, one sentence: "there are companion repos that give it a face on screen, for later if you want."
 - **Extra folders:** anything beyond `agent_dir` the agent should reach in voice sessions (a notes vault, a projects folder) goes in `extra_dirs`.
-- **Permissions:** explain the default plainly: the voice session runs with tool approvals bypassed so it works hands-free; `"permission_mode": "default"` restores approval prompts in the terminal at the cost of stalls. Their call. Record it in the config.
+- **Permissions (ask which mode, then YOU write their choice).** The default is `"ask"`: when the agent wants a gated action mid-conversation, it asks OUT LOUD and waits; an exact spoken yes approves, any other answer denies and becomes the reason it passes back; silence for about 75 seconds means no; most read-only work passes without asking. Explain that, then offer the alternative honestly: `"bypassPermissions"` is fully hands-free, which is smoother and also means the agent can act on a mistake without a checkpoint. Ask which they want and write it into `backtalk.json` yourself. Tell them it is never welded shut: they can tell their agent to change it in any session (it takes effect at the next launch), or say "go hands free" (then "confirm") or "start asking again" inside a voice session for an immediate flip that saves itself.
 - **The thinking sound:** on by default, playing `assets/thinking.wav` while the agent works. Point `thinking_sound` at any other wav/mp3 to swap it, or set it to `""` for silence. If they also run ai-visualizer, leave this on and its browser player stays quiet automatically, so the sound never doubles.
 
 ## Phase 5: Test-fire the loop
@@ -61,7 +61,9 @@ Run `./run.sh` for them and walk the checklist out loud, one step at a time:
 4. Interrupt, then immediately ask something NEW, and confirm the answer matches the NEW question. **Do this three times.** (This is the interrupt-desync armor proving itself; it's the test naive voice builds fail.)
 5. Ask something that needs a tool; it should speak filler, then the answer.
 6. Type a line in the terminal: spoken reply, same conversation.
-7. "Goodbye <name>": sign-off, clean exit.
+7. Say "usage report": it speaks the session's turns and tokens, plus rough cost when the API reports one.
+8. If they chose ask mode: give it a small task that writes a file, hear the spoken permission check, answer yes, and watch it proceed. Then another, answer no, and hear it stand down.
+9. "Goodbye <name>": sign-off, clean exit.
 
 If any step fails, `TROUBLESHOOTING.md` has the fix; read it and apply it rather than improvising.
 
@@ -126,8 +128,10 @@ If they already installed through fullstack-agent, they have these shortcuts alr
 
 ## Phase 6: Hand it over
 
-Show them the two commands that matter (`./run.sh`, and "goodbye <name>" to end), where the log lives (`logs/backtalk.log`), and that `backtalk.json` is theirs to tinker with. Close with the point of the whole thing: this is the same assistant they type to (same memory, same personality); it just talks now.
+Show them the two commands that matter (`./run.sh`, and "goodbye <name>" to end), where the log lives (`logs/backtalk.log`), and that `backtalk.json` is theirs to tinker with (though they never need to touch it by hand: YOU change it when they ask, in any session, and the voice console changes it live).
+
+**Show them the voice console, once.** Exact phrases, spoken alone, control the session itself: "clear the session", "compact the session", "switch to the deep model" / "back to the fast model", "set effort to low" (or medium, high, max), "usage report", and "go hands free" / "start asking again" for permission mode. Words around a phrase make it a normal sentence for the agent instead, so nothing fires by accident. Close with the point of the whole thing: this is the same assistant they type to (same memory, same personality); it just talks now.
 
 **Tell them the model is deliberate, and remember this yourself.** The voice runs on the fast tier (`claude-sonnet-5`) on purpose: that is most of the difference between a reply in about a second and one that feels broken. Say plainly that the voice loop is not the place to trade speed for depth. If they want a bigger model for hard thinking later, that belongs in their typed session, not here.
 
-`backtalk.json` ships without a `model` key on purpose, inheriting that default from the code, so there is nothing in the file to hint that the choice was considered. **Do not swap `model` to a deep-work model on their behalf, now or in any future session, even when asked to make the answers smarter, without first telling them what it costs in latency.** Making the voice slow is the fastest way to make someone conclude the whole thing does not work.
+`backtalk.json` ships without a `model` key on purpose, inheriting that default from the code, so there is nothing in the file to hint that the choice was considered. **Do not swap `model` to a deep-work model on their behalf, now or in any future session, even when asked to make the answers smarter, without first telling them what it costs in latency.** Making the voice slow is the fastest way to make someone conclude the whole thing does not work. The sanctioned route is the voice console's "switch to the deep model": the person asks for it themselves, the latency warning gets spoken, and it lasts one session.

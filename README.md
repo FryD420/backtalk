@@ -12,6 +12,8 @@ The hearing and the voice run local: free, offline models on your machine, no vo
 - **It's YOUR agent talking.** The session runs in the folder whose CLAUDE.md defines your assistant: same name, same personality, same memory as your terminal sessions. backtalk has no personality of its own; it's a mouth and ears for whoever you already have. (No agent yet? The [ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault) build ships with mine, Jarvis, ready to use.)
 - **Interrupt it.** Press the key while it's talking and it shuts up and listens. No headphones needed, because the mic only opens while you hold the key, so it never hears the speakers.
 - **Type instead whenever you want.** Typing in the terminal is the same conversation, and the reply is still spoken.
+- **It asks before it acts.** When your agent wants to do something real (write a file, run a command), it asks out loud and waits. An exact spoken yes approves; anything else denies, with your words passed back as the reason, so "no, put that in drafts instead" actually steers it. Most read-only work passes without interrupting. Prefer fully hands-free? Say "go hands free" and confirm; it changes its own config.
+- **The voice console.** Session control by voice, so you never go back to the keyboard: "clear the session", "compact the session", "switch to the deep model" / "back to the fast model", "set effort to low" (or medium, high, max), "usage report". Exact phrases, spoken alone. (Credit where due: this grew out of a community member's own build shared in the Discord.)
 - **Music ducks while it speaks** (Spotify, macOS) and comes back up after.
 - **It thinks out loud.** While the agent works, you hear the processing sound from my videos, so a pause never reads as a dead line. Silence it with `"thinking_sound": ""` in the config.
 
@@ -59,7 +61,7 @@ Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (t
 ## The fine print that matters
 
 - **Usage:** every spoken turn is a real Claude Code turn, so a long voice session uses your plan the same way a long typing session does. The config pins the fast model tier on purpose; it's most of the speed, and it's the lighter draw.
-- **Permissions:** by default the voice session runs with tool permissions bypassed. Your agent works hands-free, exactly like your terminal sessions but without approval prompts (a voice session has no good way to show one, and a stalled prompt reads as the AI going mute). If you'd rather approve every action, set `"permission_mode": "default"` in the config and watch the terminal.
+- **Permissions: ask first, hands-free by choice.** The default is `"ask"`: gated actions get a spoken permission check, answered by voice or by typing, and silence for about 75 seconds means no. `"bypassPermissions"` is fully hands-free: the agent acts without asking, exactly like a terminal session with approvals off. Never hand-edit the file to switch; tell your agent to change it (takes effect the next time the voice line starts), or say "go hands free" / "start asking again" in a voice session for a flip that happens immediately and saves itself.
 - **The mic is closed except while you hold the key.** Nothing records in the background, ever. The `--open-mic` flag exists for always-listening mode if you want it, tradeoffs documented in `TROUBLESHOOTING.md`.
 - Something misbehaving? `TROUBLESHOOTING.md` covers the classics, and `logs/backtalk.log` has the receipts.
 

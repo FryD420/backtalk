@@ -25,6 +25,15 @@ over a hidden warmup query so the first real turn is already hot.
 Typing in this terminal is a first-class turn too: same conversation,
 spoken reply, and typing while it talks interrupts it.
 
+THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
+session itself so you never go back to the keyboard: "clear the
+session" / "compact the session" / "switch to the deep model" / "back
+to the fast model" / "set effort to low" (or medium, high, max) /
+"usage report" / "go hands free" / "start asking again". And with
+permission_mode "ask" (the default), gated tool calls ASK OUT LOUD and
+your spoken yes or no decides them; any other answer is passed back to
+the agent as the reason.
+
 Flags:
   --open-mic   always-listening mode (VAD endpointing) instead of
                hold-to-talk. Know the tradeoff: room audio (a video,
@@ -38,6 +47,7 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import json
 import queue
 import sys
 import threading
@@ -53,6 +63,238 @@ from backtalk.vlog import log
 
 NAME = CFG["name"]
 QUIT_PHRASES = CFG["quit_phrases"]
+
+# ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
+# When the agent wants a gated tool, the SDK routes the decision here:
+# the ask is spoken, the turn pauses (the SDK waits indefinitely; the
+# timeout below is ours), and the NEXT utterance or typed line is the
+# answer. "yes" approves; anything else denies, with the user's own
+# words passed back as the reason. Silence means no.
+PERM_TIMEOUT_S = 75
+_PERM = {"fut": None, "asked_at": 0.0}   # pending ask + when it was posed
+_CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
+_INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
+# Live hands-free is OUR flag, not an SDK mode flip: the CLI refuses a
+# live switch INTO bypassPermissions unless it was launched with the
+# danger flag, so instead the gate below auto-approves silently while
+# this is on. Same behavior, no reconnect, conversation intact. A
+# session that BOOTS in bypassPermissions never consults the gate at
+# all; saying "start asking again" flips the SDK side live (that
+# direction is allowed) and turns this off. ONLY the explicit
+# bypassPermissions value arms this: any other mode (acceptEdits, plan)
+# passes through to the SDK and keeps the spoken gate for whatever the
+# SDK routes here.
+_HANDSFREE = {"on": False}
+
+# Approvals are EXACT matches after normalization, never prefixes:
+# "yesterday", "yes or no", and "yes, but do not overwrite" must all
+# fail. Anything that is not an exact yes DENIES, with the words passed
+# back to the agent as the reason. Deny is always the default.
+_YES = {"yes", "yeah", "yep", "yup", "sure", "approve", "approved",
+        "go ahead", "do it", "yes please", "yes sir", "yes boss",
+        "yes go ahead", "go for it", "green light", "okay", "ok", "y"}
+_CHAIN_MARKS = ("&&", "||", ";", "|", "$(", "`", "\n")
+
+
+def _norm_speech(text):
+    """Lowercase, every non-letter to space, collapse. Whisper loves
+    interior commas ("yes, confirm"); end-stripping alone misses them."""
+    out = []
+    for ch in text.lower():
+        out.append(ch if "a" <= ch <= "z" else " ")
+    return " ".join("".join(out).split())
+
+
+def _deny_pending(reason=_INTERRUPT_ANSWER):
+    """Resolve a pending spoken ask as a deny. Called whenever the turn
+    that posed it is being interrupted, so the ask can never outlive its
+    turn and hijack a later utterance (or stall the pipe drain)."""
+    f = _PERM["fut"]
+    if f is not None and not f.done():
+        f.set_result(reason)
+
+
+def _perm_summary(tool, tool_input, ctx):
+    """One speakable line. Never read file bodies or diffs aloud, and
+    never let a long command hide its tail: truncation is DISCLOSED and
+    shell chaining is called out (the agent composes tool_input itself,
+    so the spoken line must not be steerable into understatement)."""
+    d = tool_input or {}
+    if tool == "Bash":
+        cmd = " ".join(str(d.get("command", "")).split())
+        chained = any(m in cmd for m in _CHAIN_MARKS)
+        line = ("a chained command: " if chained else
+                "run a command: ") + cmd[:90]
+        if len(cmd) > 90:
+            line += (f", and {len(cmd) - 90} more characters. "
+                     "Check the log before approving")
+        return line
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        path = str(d.get("file_path") or d.get("notebook_path")
+                   or "a file").replace("\\", "/")
+        bits = path.rsplit("/", 2)
+        name = "/".join(bits[-2:]) if len(bits) >= 2 else path
+        return f"{'edit' if 'Edit' in tool else 'write'} the file {name}"
+    if tool == "WebFetch":
+        return f"fetch a web page: {str(d.get('url', ''))[:70]}"
+    desc = (getattr(ctx, "description", None) or "").strip()
+    name = getattr(ctx, "display_name", None) or tool
+    return f"use {name}" + (f", {desc[:70]}" if desc else "")
+
+
+def make_permission_gate(mouth):
+    from claude_agent_sdk import (PermissionResultAllow,
+                                  PermissionResultDeny)
+
+    async def gate(tool, tool_input, ctx):
+        if _HANDSFREE["on"]:
+            return PermissionResultAllow(behavior="allow")
+        what = _perm_summary(tool, tool_input, ctx)
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        _PERM["fut"] = fut
+        _PERM["asked_at"] = time.monotonic()
+        signals.static_stop()
+        log(f"[perm]   asking: {what}")
+        if tool == "Bash":   # the FULL command always reaches the log
+            log(f"[perm]   full command: {str((tool_input or {}).get('command', ''))[:2000]}")
+        mouth.say(f"Permission check. I want to {what}. Yes or no?")
+        deadline = loop.time() + PERM_TIMEOUT_S
+        answer = None
+        try:
+            while True:
+                try:
+                    answer = await asyncio.wait_for(
+                        asyncio.shield(fut), 1.0)
+                    break
+                except asyncio.TimeoutError:
+                    if loop.time() >= deadline:
+                        fut.cancel()
+                        mouth.say("No answer, so I didn't do it.")
+                        log("[perm]   timed out, denied")
+                        return PermissionResultDeny(
+                            behavior="deny",
+                            message="No spoken answer within the "
+                                    "timeout; the action was not "
+                                    "approved.",
+                            interrupt=False)
+                    # keep the ring honest while we wait
+                    if not mouth.speaking:
+                        signals.set_state("listening")
+        finally:
+            _PERM["fut"] = None
+        if answer == _INTERRUPT_ANSWER:
+            log("[perm]   turn interrupted, denied silently")
+            return PermissionResultDeny(
+                behavior="deny",
+                message="Interrupted by the user; the turn is being "
+                        "cancelled.",
+                interrupt=False)
+        approved = _norm_speech(answer) in _YES
+        # the model keeps working either way: restore the working state
+        signals.set_state("thinking")
+        signals.static_start()
+        if approved:
+            log("[perm]   approved by voice")
+            return PermissionResultAllow(behavior="allow")
+        log(f"[perm]   denied: {answer!r}")
+        return PermissionResultDeny(
+            behavior="deny",
+            message=f'Denied by voice. The user said: "{answer[:500]}"',
+            interrupt=False)
+    return gate
+
+
+# ---- THE VOICE CONSOLE: session verbs, spoken. Exact phrases only,
+# spoken alone, so ordinary sentences can never trigger them. (Grown
+# from a community member's own build shared in the Discord.)
+CONSOLE_VERBS = {
+    "clear":     ("clear the session", "clear the context",
+                  "clear context", "fresh slate", "slash clear"),
+    "compact":   ("compact the session", "compact the context",
+                  "compact context", "slash compact"),
+    "deep":      ("switch to the deep model", "use the deep model",
+                  "slash model deep"),
+    "fast":      ("switch to the fast model", "use the fast model",
+                  "back to the fast model", "slash model fast"),
+    "usage":     ("usage report", "slash usage"),
+    "handsfree": ("go hands free", "hands free mode",
+                  "stop asking for permission",
+                  "stop asking permission"),
+    "ask":       ("start asking again", "ask before acting",
+                  "ask for permission again"),
+}
+_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def console_match(text):
+    norm = " ".join(text.lower().replace("-", " ").split()).strip(" .,!?")
+    for verb, phrases in CONSOLE_VERBS.items():
+        if norm in phrases:
+            return verb
+    for lvl in _EFFORTS:
+        if norm in (f"set effort to {lvl}", f"effort {lvl}",
+                    f"slash effort {lvl}"):
+            return f"effort:{lvl}"
+    return None
+
+
+def _write_config_key(key, value):
+    """The agent rewrites the config; the person never hand-edits it.
+    Returns True on a persisted write. A file that fails to PARSE is
+    left untouched (rewriting from {} would wipe every other setting);
+    the in-memory CFG updates either way so the session behaves."""
+    from backtalk.config import CONFIG_PATH
+    CFG[key] = value
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        log(f"[console] config not writable/parsable, session-only: {e}")
+        return False
+    data[key] = value
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as e:
+        log(f"[console] config write failed, session-only: {e}")
+        return False
+    return True
+
+
+def _fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"about {round(n / 1_000_000, 1):g} million tokens"
+    if n >= 1000:
+        return f"about {round(n / 1000)} thousand tokens"
+    return f"{n} tokens"
+
+
+def _spoken_usage(sess, ctx_usage):
+    """A short CFO brief of the session, written for the ear: plain
+    numerals only (the TTS reads "40" fine; symbols come out garbled)."""
+    turns = sess["turns"]
+    parts = [f"{turns} turn{'s' if turns != 1 else ''} this session",
+             _fmt_tokens(sess["out_tokens"]) + " spoken out"]
+    cents = round(sess["cost"] * 100)
+    if cents >= 1:
+        parts.append(f"roughly {cents} cents" if cents < 100
+                     else f"roughly {round(cents / 100)} dollars")
+    try:
+        cats = (getattr(ctx_usage, "categories", None)
+                or (ctx_usage or {}).get("categories") or [])
+        # the breakdown includes "Free space" and the autocompact
+        # buffer; only OCCUPIED categories belong in the spoken number
+        total = sum(int(c.get("tokens") or 0) for c in cats
+                    if isinstance(c, dict)
+                    and "free" not in str(c.get("name", "")).lower()
+                    and "buffer" not in str(c.get("name", "")).lower())
+        if total:
+            parts.append(_fmt_tokens(total)
+                         + " sitting in the context window")
+    except Exception:
+        pass
+    return ". ".join(parts) + "."
 
 _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
@@ -283,9 +525,12 @@ async def amain():
         except IndexError:
             pass
 
+    CFG_BOOT_MODE = CFG["permission_mode"]
+    _HANDSFREE["on"] = CFG_BOOT_MODE == "bypassPermissions"
     mouth = Mouth()
     ears = Ears()
-    brain = WarmBrain(model=model)
+    brain = WarmBrain(model=model,
+                      can_use_tool=make_permission_gate(mouth))
 
     mode = "open-mic" if open_mic else f"push-to-talk ({CFG['ptt_key']})"
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
@@ -302,16 +547,156 @@ async def amain():
             "Warmup ping - reply with the single word: ready"):
         pass
     log("[backtalk] brain warm")
+    # the hidden warmup ping is plumbing, not conversation
+    brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
 
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
 
-    async def handle(text: str) -> bool:
-        """Process one utterance; returns False on quit."""
+    async def run_console(verb):
+        """One voice-console verb. The current reply was already
+        cancelled and awaited by handle(); the pipe gets drained here
+        before the command goes out. A verb that blows up must never
+        take the whole voice session down with it."""
+        try:
+            await _run_console_inner(verb)
+        except Exception as e:
+            log(f"[console] {verb} failed: {e}")
+            mouth.say("That command hit an error. Check the log.")
+            signals.set_state("idle")
+
+    async def _run_console_inner(verb):
+        _deny_pending()
+        await brain.reset_turn()
+        say_after = None
+        if verb == "clear":
+            resp = await brain.command("/clear")
+            say_after = "Cleared. Fresh slate."
+        elif verb == "compact":
+            mouth.say("Compacting. One moment.")
+            resp = await brain.command("/compact")
+            say_after = "Compacted. Same conversation, smaller footprint."
+        elif verb == "deep":
+            mouth.say("Switching to the deep model. Heads up, replies "
+                      "get slower. Say back to the fast model when "
+                      "you're done.")
+            resp = await brain.command(f"/model {CFG['deep_model']}")
+            say_after = "Deep model online, for this session only."
+        elif verb == "fast":
+            resp = await brain.command(f"/model {CFG['model']}")
+            say_after = "Back on the fast model."
+        elif verb.startswith("effort:"):
+            lvl = verb.split(":", 1)[1]
+            resp = await brain.command(f"/effort {lvl}")
+            say_after = f"Effort set to {lvl}, for this session only."
+        elif verb == "usage":
+            resp = ""
+            mouth.say(_spoken_usage(brain.session,
+                                    await brain.context_usage()))
+        elif verb == "handsfree":
+            resp = ""
+            _CONFIRM["verb"] = "handsfree"
+            _CONFIRM["at"] = time.monotonic()
+            mouth.say("Hands-free means I act without asking "
+                      "permission, and it becomes your saved default. "
+                      "Say confirm to switch.")
+        elif verb == "handsfree:confirmed":
+            resp = ""
+            saved = _write_config_key("permission_mode",
+                                      "bypassPermissions")
+            _HANDSFREE["on"] = True
+            log("[console] permission_mode -> bypassPermissions"
+                + (" (saved)" if saved else " (session only)"))
+            mouth.say(("Hands-free on, and saved as your default. "
+                       if saved else
+                       "Hands-free on for this session. The config "
+                       "file couldn't be written, so it won't stick "
+                       "past a restart. ")
+                      + "Say start asking again any time to flip it "
+                        "back.")
+        elif verb == "ask":
+            resp = ""
+            saved = _write_config_key("permission_mode", "ask")
+            _HANDSFREE["on"] = False
+            flipped = True
+            if CFG_BOOT_MODE == "bypassPermissions":
+                # a bypass-booted session never consults the gate, so
+                # the SDK itself must flip (the safe direction is
+                # allowed live). If that fails, saying "done" would be
+                # a lie: the agent would keep acting silently.
+                try:
+                    await brain.set_permission_mode("ask")
+                except Exception as e:
+                    flipped = False
+                    log(f"[console] live flip to ask FAILED: {e}")
+            log("[console] permission_mode -> ask"
+                + (" (saved)" if saved else " (session only)"))
+            if flipped:
+                mouth.say("Done. I'll ask out loud before real "
+                          "actions"
+                          + (", and that's saved as your default."
+                             if saved else
+                             ". The config file couldn't be written, "
+                             "so tell me again after a restart."))
+            else:
+                mouth.say("I saved asking as your default, but this "
+                          "session couldn't switch over. Restart the "
+                          "voice line to get asking back.")
+        else:
+            resp = ""
+        if say_after:
+            # the CLI answers slash commands with its own text
+            # (confirmations, API errors); an error outranks our line
+            low = (resp or "").lower()
+            if resp and ("error" in low or "invalid" in low):
+                mouth.say(resp[:160])
+                log(f"[console] {verb} answered: {resp[:120]}")
+            else:
+                mouth.say(say_after)
+        signals.set_state("idle")
+
+    async def handle(text: str, spoke_from: float | None = None) -> bool:
+        """Process one utterance; returns False on quit. spoke_from is
+        when the utterance STARTED (the PTT press), so an answer can be
+        told apart from speech that began before the ask even existed."""
         nonlocal speak_task
         log(f"[you]    {text}")
+        # A pending spoken permission ask owns the next utterance IF
+        # that utterance started after the ask was posed. Speech that
+        # began earlier is the user interrupting the turn, not
+        # answering a question they never heard: the ask resolves as a
+        # silent deny and the utterance falls through as a normal
+        # interrupt. Quit wins either way, but only as an EXACT phrase
+        # here ("No! Don't hang up, skip it" must stay a deny reason,
+        # not kill the session).
+        if _PERM["fut"] is not None and not _PERM["fut"].done():
+            started_after = (spoke_from is None
+                             or spoke_from >= _PERM["asked_at"])
+            if _norm_speech(text) in {_norm_speech(q)
+                                      for q in QUIT_PHRASES}:
+                _PERM["fut"].set_result("no")
+                # falls through to the quit body below
+            elif started_after:
+                _PERM["fut"].set_result(text)
+                return True
+            else:
+                _deny_pending()
+        # A pending hands-free confirm owns it too, for two minutes;
+        # after that it expires and speech flows normally again.
+        verb = None
+        if _CONFIRM["verb"]:
+            pend, _CONFIRM["verb"] = _CONFIRM["verb"], None
+            expired = time.monotonic() - _CONFIRM["at"] > 120
+            if not expired and _norm_speech(text) in (
+                    "confirm", "confirmed", "yes confirm",
+                    "yes confirmed"):
+                verb = pend + ":confirmed"
+            elif not expired and not any(q in text.lower()
+                                         for q in QUIT_PHRASES):
+                mouth.say("Staying as we are.")
+                return True
         if any(q in text.lower() for q in QUIT_PHRASES):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
@@ -321,6 +706,7 @@ async def amain():
             return False
         if speak_task and not speak_task.done():
             log("[turn] interrupted mid-reply by new input")
+            _deny_pending()          # an ask never outlives its turn
             speak_task.cancel()
             mouth.shut_up()
         if speak_task:
@@ -336,10 +722,17 @@ async def amain():
             except Exception:
                 pass
             speak_task = None
+        verb = verb or console_match(text)
+        if verb:
+            await run_console(verb)
+            return True
         signals.set_state("thinking")
         signals.static_start()
         # Clean the pipe: drain the interrupted turn's leftovers so the
-        # new question can't pair with a stale ResultMessage.
+        # new question can't pair with a stale ResultMessage. A gate
+        # that fired in the meantime resolves first, or the drain would
+        # wait on a ResultMessage the CLI is withholding for an answer.
+        _deny_pending()
         await brain.reset_turn()
         speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
         return True
@@ -387,9 +780,14 @@ async def amain():
                         return
                     continue
                 press_fut.result(); press_fut = None
-                if speak_task and not speak_task.done():
+                press_t = time.monotonic()
+                perm_wait = (_PERM["fut"] is not None
+                             and not _PERM["fut"].done())
+                if speak_task and not speak_task.done() and not perm_wait:
                     log("[turn] interrupted mid-reply — key pressed")
                     speak_task.cancel()          # the button = interrupt
+                # During a permission ask the TURN stays alive; the
+                # press only silences playback and records the answer.
                 mouth.shut_up()
                 signals.static_stop()            # button kills the static too
                 signals.set_state("listening")
@@ -402,7 +800,7 @@ async def amain():
                     log("[ptt] (tap or empty — ignored)")
                     signals.set_state("idle")
                     continue
-                if not await handle(text):
+                if not await handle(text, spoke_from=press_t):
                     return
     except KeyboardInterrupt:
         pass

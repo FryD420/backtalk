@@ -14,6 +14,9 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **Two voices answering at once**: two copies are running. `./run.sh` kills the previous instance on launch; if you started one some other way, kill it. One body, one mouth.
 - **Spotify stays quiet after it stops talking**: the restore is debounced ~0.5s; if the process was force-killed mid-speech the restore can be lost. It self-corrects on the next duck, or nudge the volume by hand.
 - **ElevenLabs sounds worse than their website**: their site previews are mastered demo clips; the raw API never matches them. The shipped `master` ffmpeg chain closes the gap; make sure `ffmpeg` is installed, and don't set the style parameter or switch to the multilingual model for English (both make delivery slow and dull).
+- **It started asking permission out loud after an update**: that is the new default (safe by default, hands-free by choice). Say "go hands free" in a voice session and confirm for an immediate, saved flip; or tell your agent to set `"permission_mode": "bypassPermissions"`, which takes effect the next time the voice line starts. The agent writes the config, never you.
+- **It asked permission, then said "no answer, so I didn't do it"**: the spoken ask waits about 75 seconds, then treats silence as no. Hold the key and answer with an exact "yes" (or "go ahead", "approved") to approve; anything else denies and is passed back to the agent as the reason, so spoken redirections work.
+- **A voice command didn't trigger**: console phrases match exactly, spoken alone: "clear the session", "compact the session", "switch to the deep model", "back to the fast model", "set effort to low" (or medium, high, max), "usage report", "go hands free", "start asking again". Extra words around them make a normal sentence for the agent instead. That guard is deliberate.
 - **It answers my previous question instead of the one I just asked**: this is the interrupt-desync bug this codebase specifically armors against (`brain.reset_turn`); if you EVER see it, something has changed in the SDK. Grab `logs/backtalk.log` and file an issue; the log will show whether the stale-turn drain ran.
 
 ## Windows notes
@@ -38,6 +41,11 @@ hold key -> ears.record_held (sounddevice, 16kHz int16)
          -> mouth.say_chunk (kokoro in-process -> one long-lived
                              OutputStream; ElevenLabs optional)
 signals.py mirrors state to .voice_* files (+ optional barehands state/)
+permission_mode "ask": gated tools pause the turn and route to a spoken
+                       yes/no (main.make_permission_gate). The LIVE
+                       hands-free switch is a gate flag; a session
+                       BOOTED hands-free is real SDK bypassPermissions
+                       and never consults the gate
 ```
 
 Three land mines with warning signs on them; do not "simplify" these away:
@@ -45,6 +53,7 @@ Three land mines with warning signs on them; do not "simplify" these away:
 1. **The key-repeat filter in `ptt.py`.** The OS fires on_press continuously while a key is held; without the held-state flag, every repeat cancels the reply before it can speak.
 2. **The one long-lived output stream in `mouth.py`.** A fresh stream per sentence causes onset blips or dead air on USB interfaces, Bluetooth, and streaming mixers. Interrupts pad silence into the stream; they never close it.
 3. **`brain.reset_turn` in `brain.py`.** The SDK has one shared message stream with no query/response pairing; an interrupted turn leaves its leftovers buffered, and without the drain every later answer is off by one question.
+4. **The pending-permission routing in `main.py`.** While a spoken permission ask is waiting, the next utterance is the ANSWER: it must never be treated as an interrupt or a new turn, or the paused turn gets cancelled out from under the SDK. The same goes for the live hands-free switch: the CLI refuses a live flip INTO bypassPermissions (it needs the danger flag at launch), which is why hands-free is a gate flag instead of an SDK mode change.
 
 ## Verify a working install
 
@@ -54,4 +63,6 @@ Three land mines with warning signs on them; do not "simplify" these away:
 4. Interrupt, then ask something NEW → the answer matches the NEW question (repeat 3×: that's the stream drain proving itself).
 5. Ask something that needs a tool ("what's in my notes about X") → it speaks filler within a couple of seconds, then the answer.
 6. Type a message in the terminal → spoken reply, same conversation.
-7. Say "goodbye <name>" → sign-off plays, process exits, music restores.
+7. Say "usage report" → it speaks turns and tokens (plus cost when the API reports one).
+8. In ask mode: request a small file write → the spoken permission check plays → "yes" proceeds, and a second attempt answered "no" stands down.
+9. Say "goodbye <name>" → sign-off plays, process exits, music restores.

@@ -44,13 +44,30 @@ DEFAULTS = {
     # speed difference people ask about; a deep-work model makes every
     # reply noticeably slower and burns usage doing it.
     "model": "claude-sonnet-5",
-    # Tool permissions for the voice session. "bypassPermissions" = the
-    # agent uses its tools freely, exactly like your terminal session
-    # but WITHOUT approval prompts — a voice session has no good way to
-    # show one, and a stalled prompt reads as the AI going mute
-    # mid-sentence. Set "default" if you'd rather approve in the
-    # terminal and don't mind the stalls.
-    "permission_mode": "bypassPermissions",
+    # The deep-work model for the voice console's "switch to the deep
+    # model" command ("back to the fast model" returns to "model"
+    # above). Full id ON PURPOSE, same reasoning as "model". The switch
+    # lasts one session and is always spoken; this default never moves
+    # by itself.
+    "deep_model": "claude-opus-5",
+    # Tool permissions for the voice session. "ask" is the default ON
+    # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
+    # gated tool (write a file, run a real command), it ASKS OUT LOUD
+    # and waits. Answer by voice or by typing. An EXACT yes approves
+    # ("yes", "yeah", "go ahead", "approved"...); anything else denies,
+    # and your words are passed back to the agent as the reason, so
+    # "no, put it in drafts instead" actually steers it. No answer
+    # within 75 seconds means no, out loud. Most read-only work passes
+    # without asking; anything that changes things asks.
+    # "bypassPermissions" is fully hands-free: the agent acts without
+    # asking, exactly like a terminal session with approvals off.
+    # Never hand-edit this file to switch: tell your agent to change
+    # it (takes effect next launch), or say "go hands free" (then
+    # "confirm") or "start asking again" inside a voice session for an
+    # immediate flip that also saves. The legacy value "default" now
+    # behaves as "ask" (a headless voice session could never render
+    # the terminal prompt it promised).
+    "permission_mode": "ask",
     # Extra folders the agent may access beyond agent_dir (e.g. your
     # notes vault). Absolute paths or ~ paths.
     "extra_dirs": [],
