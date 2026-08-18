@@ -107,13 +107,13 @@ Offer all of this, do not push it. If they say "just this piece for now," tell t
 
 They should never have to remember a command to start talking to their agent. Before handing over, put a launcher on their Desktop named after their agent, and **test it by double-clicking it with them.** Never hand over an untested shortcut.
 
-The launcher just starts the voice line the way they would from the terminal, in a window they can see and close (**visible or minimized, never hidden** — a hidden background launcher looks like malware to antivirus, and closing the window is how they stop it). Point its output at the existing log so a failed start stays readable.
+The launcher just starts the voice line the way they would from the terminal, in a window they can see and close (**visible or minimized, never hidden**: a hidden background launcher looks like malware to antivirus, and closing the window is how they stop it). Point its output at the existing log so a failed start stays readable.
 
 **macOS (`.command`), and this line is MANDATORY:**
 
 ```bash
 #!/bin/bash
-export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:$PATH"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 ```
 
 A double-clicked `.command` launches with a bare system PATH where `uv` does not exist, and their shell profile never runs. Without that export the icon fails **silently**: the window flashes and closes, with no error anyone can read. Then `cd` to the backtalk folder and run `./run.sh`. Make the file executable, and warn them once that the first double-click may ask permission; that is macOS being protective, click Open.
