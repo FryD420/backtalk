@@ -103,6 +103,27 @@ Tell them what to expect: a fresh Claude Code session opens with the installer a
 
 Offer all of this, do not push it. If they say "just this piece for now," tell them good choice and get out of the way.
 
+## Phase 5.75: Leave them an icon
+
+They should never have to remember a command to start talking to their agent. Before handing over, put a launcher on their Desktop named after their agent, and **test it by double-clicking it with them.** Never hand over an untested shortcut.
+
+The launcher just starts the voice line the way they would from the terminal, in a window they can see and close (**visible or minimized, never hidden** — a hidden background launcher looks like malware to antivirus, and closing the window is how they stop it). Point its output at the existing log so a failed start stays readable.
+
+**macOS (`.command`), and this line is MANDATORY:**
+
+```bash
+#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:/opt/homebrew/sbin:$PATH"
+```
+
+A double-clicked `.command` launches with a bare system PATH where `uv` does not exist, and their shell profile never runs. Without that export the icon fails **silently**: the window flashes and closes, with no error anyone can read. Then `cd` to the backtalk folder and run `./run.sh`. Make the file executable, and warn them once that the first double-click may ask permission; that is macOS being protective, click Open.
+
+**Windows (`.bat`):** `cd /d` to the backtalk folder and run `uv run python -m backtalk.main`. Windows `.bat` files inherit the user's PATH, so no export is needed there.
+
+**Do NOT set this to run at login.** A voice line starting on every boot for someone who may use it occasionally is presumptuous, and a hidden autostart entry is exactly the shape antivirus flags. The icon is the whole feature: they click it when they want to talk.
+
+If they already installed through fullstack-agent, they have these shortcuts already; skip this phase rather than making a second set.
+
 ## Phase 6: Hand it over
 
 Show them the two commands that matter (`./run.sh`, and "goodbye <name>" to end), where the log lives (`logs/backtalk.log`), and that `backtalk.json` is theirs to tinker with. Close with the point of the whole thing: this is the same assistant they type to (same memory, same personality); it just talks now.
