@@ -127,3 +127,7 @@ If they already installed through fullstack-agent, they have these shortcuts alr
 ## Phase 6: Hand it over
 
 Show them the two commands that matter (`./run.sh`, and "goodbye <name>" to end), where the log lives (`logs/backtalk.log`), and that `backtalk.json` is theirs to tinker with. Close with the point of the whole thing: this is the same assistant they type to (same memory, same personality); it just talks now.
+
+**Tell them the model is deliberate, and remember this yourself.** The voice runs on the fast tier (`claude-sonnet-5`) on purpose: that is most of the difference between a reply in about a second and one that feels broken. Say plainly that the voice loop is not the place to trade speed for depth. If they want a bigger model for hard thinking later, that belongs in their typed session, not here.
+
+`backtalk.json` ships without a `model` key on purpose, inheriting that default from the code, so there is nothing in the file to hint that the choice was considered. **Do not swap `model` to a deep-work model on their behalf, now or in any future session, even when asked to make the answers smarter, without first telling them what it costs in latency.** Making the voice slow is the fastest way to make someone conclude the whole thing does not work.
