@@ -136,6 +136,8 @@ A double-clicked `.command` launches with a bare system PATH where `uv` does not
 
 **Do NOT set this to run at login.** A voice line starting on every boot for someone who may use it occasionally is presumptuous, and a hidden autostart entry is exactly the shape antivirus flags. The icon is the whole feature: they click it when they want to talk.
 
+**A second icon beside it: `Update <name>`.** Same rules: the export line on macOS, a visible window, executable, tested by double-click. It shows what is arriving, then applies it: `cd` to the backtalk folder, then `git fetch -q origin`, `git log --oneline "..@{u}"`, `git pull --ff-only`. On Windows end with `pause` so the changelog stays readable instead of the window vanishing. If the folder has no `.git` (it arrived as a zip), convert it in place first, exactly once: `git init -b main`, `git remote add origin https://github.com/jaredrhod/backtalk`, `git fetch origin`, `git reset origin/main` (a plain reset, NEVER `--hard`: their edited config has to survive), `git branch --set-upstream-to=origin/main main`. And when you hand the icons over, say the update half out loud: "if you ever want the newest version, double-click `Update <name>`; it shows you what changed, and it never touches your files."
+
 If they already installed through fullstack-agent, they have these shortcuts already; skip this phase rather than making a second set.
 
 ## Phase 6: Hand it over
