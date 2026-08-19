@@ -34,7 +34,7 @@ The installer sets up a Python environment, the two local AI models (speech-to-t
 
 **Already in a Claude Code session with your agent?** One sentence does the whole install: *"clone https://github.com/jaredrhod/backtalk.git, then read backtalk/backtalk.md and set me up."* Your agent runs the installer and the wizard for you.
 
-**The manual way:** edit `backtalk.json`. Point `agent_dir` at the folder whose CLAUDE.md is your agent, set `name` to your agent's name, pick a `ptt_key`. Then:
+**The manual way:** copy `backtalk.json.example` to `backtalk.json` (your copy is untracked, so updates never touch it), then edit it. Point `agent_dir` at the folder whose CLAUDE.md is your agent, set `name` to your agent's name, pick a `ptt_key`. Then:
 
 ```
 ./run.sh
@@ -76,7 +76,7 @@ Speech recognition by [faster-whisper](https://github.com/SYSTRAN/faster-whisper
 
 ## Updating
 
-backtalk improves continuously (several of its best fixes came from this community within hours of being reported). To update, say to your agent: **"pull the latest backtalk and tell me what changed."** Or run `git pull` in this folder yourself. Your config, your keys, and your agent's identity live outside the tracked files, so updates never touch them. Installed through fullstack-agent? `./fullstack-agent/update.sh` updates every piece at once and prints what changed.
+backtalk improves continuously (several of its best fixes came from this community within hours of being reported). To update, double-click the `Update` icon setup left on your Desktop, or run `./update.sh` (`update.bat` on Windows) in this folder: either shows you what changed before applying it. Saying **"pull the latest backtalk and tell me what changed"** to your agent works too. Your config, your keys, and your agent's identity live outside the tracked files, so updates never touch them. Installed through fullstack-agent? `./fullstack-agent/update.sh` updates every piece at once and prints what changed.
 
 ## The rest of it
 
