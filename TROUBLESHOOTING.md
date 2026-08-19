@@ -29,6 +29,15 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **One copy at a time:** run.sh's single-instance guard is Mac and Linux; on Windows, close the old window before starting a new one, or two voices answer one mic.
 - **Speed:** `stt_device: "auto"` uses CUDA when present and CPU otherwise; CPU with `small.en` is plenty fast on a normal machine.
 
+## The voice went robotic again (ElevenLabs users)
+
+That sound is the safety net working: on any ElevenLabs failure, backtalk falls back to the built-in Kokoro voice instead of going mute. The reason is one line in `logs/backtalk.log`; look for `elevenlabs failed`. The usual causes, most common first:
+
+1. **Out of credits.** The free tier's monthly allowance goes fast in real conversation. Check usage on your ElevenLabs dashboard; the starter plan fixes it.
+2. **The key isn't reachable.** The keychain item is `backtalk-elevenlabs` (macOS/Linux); on Windows it's the `ELEVENLABS_API_KEY` environment variable, which only newly opened programs can see, so restart the voice line from a fresh window after setting it.
+3. **`ffmpeg` missing.** Run `ffmpeg -version`; if that fails, install it (`brew install ffmpeg` / `apt install ffmpeg` / `winget install Gyan.FFmpeg`).
+4. **No internet.** The built-in voice covers you until it's back; nothing to fix in backtalk.
+
 ## Hands-free listening: the tradeoff
 
 Hands-free listening (the setup question, `"mic_mode": "open"`, the spoken "go hands free", or the `--open-mic` launch flag) listens continuously with voice-activity detection instead of hold-to-talk. Know what you're trading: any speech in the room (a video, music with vocals, another voice assistant) can be transcribed and answered as if it were you. Push to talk is the default because the button is a perfect voice-activity detector and the mic is *closed* the rest of the time. Two things stay true in hands-free: the talk key still works (it interrupts, and holding it always gets you heard over room noise), and spoken permission checks accept only an exact "yes", so stray room audio cannot approve an action. With open speakers, answer permission checks with the button held, or wear headphones. `--barge-in` (interrupting it by talking over it) additionally requires headphones, or it hears its own reply and interrupts itself.
