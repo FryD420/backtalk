@@ -141,6 +141,8 @@ If they already installed through fullstack-agent, they have these shortcuts alr
 
 Show them the two commands that matter (`./run.sh`, and "goodbye <name>" to end), where the log lives (`logs/backtalk.log`), and that `backtalk.json` is theirs to tinker with (though they never need to touch it by hand: YOU change it when they ask, in any session, and the voice console changes it live).
 
+**Tell them how updates work, once.** Jared ships fixes to this repo often, several straight from this community. Any time, in any session, they can say: "pull the latest backtalk and tell me what changed." Their config and identity are never touched by an update.
+
 **Show them the voice console, once.** Exact phrases, spoken alone, control the session itself: "clear the session", "compact the session", "switch to the deep model" / "back to the fast model", "set effort to low" (or medium, high, max), "usage report", "go hands free" / "push to talk mode" for the microphone, and "stop asking for permission" / "start asking again" for approvals. Words around a phrase make it a normal sentence for the agent instead, so nothing fires by accident. Close with the point of the whole thing: this is the same assistant they type to (same memory, same personality); it just talks now.
 
 **Tell them the model is deliberate, and remember this yourself.** The voice runs on the fast tier (`claude-sonnet-5`) on purpose: that is most of the difference between a reply in about a second and one that feels broken. Say plainly that the voice loop is not the place to trade speed for depth. If they want a bigger model for hard thinking later, that belongs in their typed session, not here.
