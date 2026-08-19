@@ -29,6 +29,7 @@ only the spoken-delivery discipline (config.DISCIPLINE): the medium,
 never the character.
 """
 import asyncio
+import os
 import re
 import warnings
 
@@ -45,8 +46,12 @@ from backtalk.vlog import log
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
+SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
+
+
 class WarmBrain:
-    def __init__(self, model: str | None = None, can_use_tool=None):
+    def __init__(self, model: str | None = None, can_use_tool=None,
+                 resume_id: str | None = None):
         # Full model id ON PURPOSE — never a bare alias. The SDK
         # resolves aliases through its own bundled CLI and can silently
         # land on an older model.
@@ -59,6 +64,12 @@ class WarmBrain:
         self.session = {"turns": 0, "out_tokens": 0, "in_tokens": 0,
                         "cost": 0.0}
         self._client: ClaudeSDKClient | None = None
+        # The session to reattach to at the FIRST start only (config key
+        # resume_last_session). Consumed on use: a desync rebuild in
+        # reset_turn() must always start FRESH: a rebuild means a turn
+        # went sideways mid-stream, the wrong moment to gamble on
+        # reattaching. (Community proposal, issue #1.)
+        self._resume_id = resume_id
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
@@ -76,17 +87,36 @@ class WarmBrain:
             # shadowed. That IS the chosen behavior, so boot quietly.
             warnings.filterwarnings("ignore",
                                     category=CanUseToolShadowedWarning)
-        opts = ClaudeAgentOptions(
-            cwd=CFG["agent_dir"],
-            model=self.model,
-            system_prompt={"type": "preset", "preset": "claude_code",
-                           "append": DISCIPLINE},
-            include_partial_messages=True,
-            permission_mode=sdk_mode,
-            can_use_tool=self._can_use_tool,
-            add_dirs=CFG["extra_dirs"],
-        )
-        self._client = ClaudeSDKClient(options=opts)
+        resume, self._resume_id = self._resume_id, None   # consume once
+
+        def _opts(rid):
+            return ClaudeAgentOptions(
+                cwd=CFG["agent_dir"],
+                model=self.model,
+                system_prompt={"type": "preset", "preset": "claude_code",
+                               "append": DISCIPLINE},
+                include_partial_messages=True,
+                permission_mode=sdk_mode,
+                can_use_tool=self._can_use_tool,
+                add_dirs=CFG["extra_dirs"],
+                resume=rid,
+            )
+        if resume:
+            try:
+                self._client = ClaudeSDKClient(options=_opts(resume))
+                await self._client.connect()
+                log(f"[brain] resumed session {resume[:8]}")
+                return
+            except Exception as e:
+                # a stale or invalid saved session must never brick the
+                # launch. Fall back to a fresh conversation and say so.
+                log(f"[brain] resume failed ({str(e)[:80]}), "
+                    f"starting fresh")
+                try:
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+        self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
 
     async def set_permission_mode(self, backtalk_mode: str):
@@ -103,6 +133,21 @@ class WarmBrain:
             return await self._client.get_context_usage()
         except Exception:
             return None
+
+    def _remember_session(self, rm):
+        """Persist the session id after a completed turn, so the next
+        launch can reattach (config: resume_last_session). Must never
+        break a turn; silence on any failure."""
+        if not CFG.get("resume_last_session"):
+            return
+        sid = getattr(rm, "session_id", None)
+        if not sid:
+            return
+        try:
+            with open(SESSION_FILE, "w") as f:
+                f.write(sid)
+        except OSError:
+            pass
 
     def _tally(self, rm, count_turn=True):
         """Session usage bookkeeping. Must never break a turn."""
@@ -145,6 +190,7 @@ class WarmBrain:
                 elif t == "ResultMessage":
                     self._dirty = False
                     self._tally(msg, count_turn=False)
+                    self._remember_session(msg)
                     break
 
         try:
@@ -248,6 +294,7 @@ class WarmBrain:
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
+                self._remember_session(msg)
                 break
         tail = buf.strip()
         if tail:

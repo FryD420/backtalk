@@ -619,10 +619,21 @@ async def amain():
     _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
     _MIC["mode"] = "open" if (open_mic
                               or CFG.get("mic_mode") == "open") else "ptt"
+    # resume_last_session: reattach to the saved conversation, if any
+    resume_id = None
+    if CFG.get("resume_last_session"):
+        try:
+            from backtalk.brain import SESSION_FILE
+            with open(SESSION_FILE) as f:
+                resume_id = f.read().strip() or None
+        except OSError:
+            resume_id = None
+
     mouth = Mouth()
     ears = Ears()
     brain = WarmBrain(model=model,
-                      can_use_tool=make_permission_gate(mouth))
+                      can_use_tool=make_permission_gate(mouth),
+                      resume_id=resume_id)
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -665,6 +676,14 @@ async def amain():
     log("[backtalk] brain warm")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
+    # a configured effort level applies at launch (saved by the spoken
+    # "set effort to X", or written by the person's agent on request)
+    boot_effort = str(CFG.get("effort") or "").strip().lower()
+    if boot_effort in _EFFORTS:
+        await brain.command(f"/effort {boot_effort}")
+        log(f"[backtalk] effort set to {boot_effort} (from config)")
+    elif boot_effort:
+        log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
@@ -706,7 +725,12 @@ async def amain():
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
             resp = await brain.command(f"/effort {lvl}")
-            say_after = f"Effort set to {lvl}, for this session only."
+            saved = _write_config_key("effort", lvl)
+            say_after = (f"Effort set to {lvl}, and saved as your "
+                         "default." if saved else
+                         f"Effort set to {lvl} for this session. The "
+                         "config file couldn't be written, so it won't "
+                         "stick past a restart.")
         elif verb == "usage":
             resp = ""
             mouth.say(_spoken_usage(brain.session,

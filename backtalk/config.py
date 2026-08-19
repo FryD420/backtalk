@@ -88,6 +88,24 @@ DEFAULTS = {
     # (the switch saves itself here). The --open-mic launch flag
     # forces "open" for one session.
     "mic_mode": "ptt",
+    # Playback speed for the built-in voice: 1.0 is Kokoro's native
+    # pace, 1.15 is noticeably brisker, 0.9 is slower. Kokoro's own
+    # pipeline implements it, so quality holds across sane values
+    # (roughly 0.7 to 1.5). ElevenLabs pace lives in the master chain's
+    # atempo instead. (Grew out of a community proposal, issue #1.)
+    "speed": 1.0,
+    # Resume the previous conversation on launch. OFF by default: a
+    # fresh session every launch is the predictable behavior. Set true
+    # and backtalk saves the session id after every completed turn
+    # (signals_dir/.backtalk_session) and reattaches to it at the next
+    # launch, so killing the window stops costing you the conversation.
+    # A resume that fails falls back to a fresh session and says so in
+    # the log. (Grew out of the same community proposal, issue #1.)
+    "resume_last_session": False,
+    # Reasoning effort for the voice session: "" inherits the model's
+    # default; "low" / "medium" / "high" / "max" applies at launch.
+    # Saying "set effort to X" in a voice session saves itself here.
+    "effort": "",
     # The voice (Kokoro, local, free). bm_lewis is the proven default —
     # British male, the butler register. Others: bm_george, bm_daniel,
     # bm_fable, am_michael, af_heart... The first letter picks the

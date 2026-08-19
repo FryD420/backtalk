@@ -107,7 +107,11 @@ def split_sentences(text: str) -> list[str]:
 def _stream_kokoro(text: str):
     """One sentence -> int16 PCM chunks at 24kHz, in-process."""
     pipe = warm()
-    for _, _, audio in pipe(text, voice=CFG["voice"]):
+    try:
+        speed = float(CFG.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    for _, _, audio in pipe(text, voice=CFG["voice"], speed=speed):
         a = np.asarray(audio, dtype=np.float32)
         if a.size:
             yield (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
