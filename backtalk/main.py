@@ -77,7 +77,8 @@ QUIT_PHRASES = CFG["quit_phrases"]
 # answer. "yes" approves; anything else denies, with the user's own
 # words passed back as the reason. Silence means no.
 PERM_TIMEOUT_S = 75
-_PERM = {"fut": None, "asked_at": 0.0}   # pending ask + when it was posed
+_PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
+         "hinted": False}                # escape-hatch hint said yet?
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
@@ -129,11 +130,51 @@ def _deny_pending(reason=_INTERRUPT_ANSWER):
         f.set_result(reason)
 
 
-def _perm_summary(tool, tool_input, ctx):
-    """One speakable line. Never read file bodies or diffs aloud, and
-    never let a long command hide its tail: truncation is DISCLOSED and
-    shell chaining is called out (the agent composes tool_input itself,
-    so the spoken line must not be steerable into understatement)."""
+def _human_what(tool, tool_input, ctx):
+    """The SHORT spoken form, built for a person who has never seen a
+    terminal: plain words, no paths, no syntax. Built by code, never by
+    the model, so it cannot understate; and every ask offers "details",
+    which reads the full literal form below. (Field case: the gate read
+    whole file paths and command syntax at a brand-new user.)"""
+    d = tool_input or {}
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        path = str(d.get("file_path") or d.get("notebook_path")
+                   or "a file").replace("\\", "/")
+        name = path.rsplit("/", 1)[-1]
+        import os as _os
+        homes = [CFG.get("agent_dir", "")] + list(CFG.get("extra_dirs")
+                                                  or [])
+        in_vault = any(h and path.startswith(str(h).rstrip("/") + "/")
+                       for h in (CFG.get("extra_dirs") or []))
+        verb = "edit" if "Edit" in tool else "create or change"
+        if in_vault and name.endswith(".md"):
+            return f"{verb} a note in your vault called {name[:-3]}"
+        return f"{verb} a file called {name}"
+    if tool == "Bash":
+        cmd = " ".join(str(d.get("command", "")).split())
+        first = (cmd.split() or ["a"])[0].rsplit("/", 1)[-1]
+        chained = any(m in cmd for m in _CHAIN_MARKS)
+        return (f"run a {first} command in the terminal"
+                + (", with several chained parts" if chained else ""))
+    if tool == "WebFetch":
+        url = str(d.get("url", ""))
+        host = url.split("//", 1)[-1].split("/", 1)[0] or "a site"
+        return f"read a web page at {host}"
+    name = getattr(ctx, "display_name", None) or tool
+    return f"use the {name} tool"
+
+
+_DETAILS = {"details", "the details", "give me details",
+            "give me the details", "what command", "what is it",
+            "say more", "more", "what exactly", "the exact command"}
+
+
+def _full_detail(tool, tool_input, ctx):
+    """The full literal form, spoken only when the person asks for
+    "details". Never lets a long command hide its tail: truncation is
+    DISCLOSED and shell chaining is called out (the agent composes
+    tool_input itself, so this line must not be steerable into
+    understatement)."""
     d = tool_input or {}
     if tool == "Bash":
         cmd = " ".join(str(d.get("command", "")).split())
@@ -164,38 +205,60 @@ def make_permission_gate(mouth):
     async def gate(tool, tool_input, ctx):
         if _AUTOAPPROVE["on"]:
             return PermissionResultAllow(behavior="allow")
-        what = _perm_summary(tool, tool_input, ctx)
+        what = _human_what(tool, tool_input, ctx)
+        detail = _full_detail(tool, tool_input, ctx)
         loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        _PERM["fut"] = fut
-        _PERM["asked_at"] = time.monotonic()
         signals.static_stop()
         log(f"[perm]   asking: {what}")
+        log(f"[perm]   detail: {detail}")
         if tool == "Bash":   # the FULL command always reaches the log
             log(f"[perm]   full command: {str((tool_input or {}).get('command', ''))[:2000]}")
-        mouth.say(f"Permission check. I want to {what}. Yes or no?")
-        deadline = loop.time() + PERM_TIMEOUT_S
+        ask = f"Permission check. I want to {what}. Yes, no, or details?"
+        if not _PERM["hinted"]:
+            # the escape hatch announces itself exactly once, at the
+            # moment it becomes relevant (a field case: a new user
+            # couldn't find the phrase to turn the checks off)
+            _PERM["hinted"] = True
+            ask += (" And any time you're done with these checks, say "
+                    "stop asking for permission.")
+        mouth.say(ask)
         answer = None
         try:
-            while True:
-                try:
-                    answer = await asyncio.wait_for(
-                        asyncio.shield(fut), 1.0)
-                    break
-                except asyncio.TimeoutError:
-                    if loop.time() >= deadline:
-                        fut.cancel()
-                        mouth.say("No answer, so I didn't do it.")
-                        log("[perm]   timed out, denied")
-                        return PermissionResultDeny(
-                            behavior="deny",
-                            message="No spoken answer within the "
-                                    "timeout; the action was not "
-                                    "approved.",
-                            interrupt=False)
-                    # keep the ring honest while we wait
-                    if not mouth.speaking:
-                        signals.set_state("listening")
+            deadline = loop.time() + PERM_TIMEOUT_S
+            while answer is None:
+                fut = loop.create_future()
+                _PERM["fut"] = fut
+                _PERM["asked_at"] = time.monotonic()
+                while True:
+                    try:
+                        got = await asyncio.wait_for(
+                            asyncio.shield(fut), 1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        if loop.time() >= deadline:
+                            fut.cancel()
+                            mouth.say("No answer, so I didn't do it.")
+                            log("[perm]   timed out, denied")
+                            return PermissionResultDeny(
+                                behavior="deny",
+                                message="No spoken answer within the "
+                                        "timeout; the action was not "
+                                        "approved.",
+                                interrupt=False)
+                        # keep the ring honest while we wait
+                        if not mouth.speaking:
+                            signals.set_state("listening")
+                if (got != _INTERRUPT_ANSWER
+                        and _norm_speech(got) in _DETAILS):
+                    # read the full literal form, then ask again with a
+                    # fresh clock: asking for details is engagement,
+                    # not silence
+                    log("[perm]   details requested")
+                    mouth.say(f"The details: I want to {detail}. "
+                              "Yes or no?")
+                    deadline = loop.time() + PERM_TIMEOUT_S
+                    continue
+                answer = got
         finally:
             _PERM["fut"] = None
         if answer == _INTERRUPT_ANSWER:
@@ -238,7 +301,15 @@ CONSOLE_VERBS = {
     "micptt":    ("push to talk", "push to talk mode",
                   "back to push to talk", "back to the button"),
     "noask":     ("stop asking for permission",
-                  "stop asking permission", "auto approve",
+                  "stop asking permission",
+                  "stop asking me for permission",
+                  "turn off the permission prompt",
+                  "turn off the permission prompts",
+                  "turn off the permissions prompt",
+                  "turn off the permissions prompts",
+                  "turn off permissions", "turn off permission checks",
+                  "disable the permission checks",
+                  "disable permission checks", "auto approve",
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
