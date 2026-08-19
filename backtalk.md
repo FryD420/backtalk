@@ -122,7 +122,7 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 A double-clicked `.command` launches with a bare system PATH where `uv` does not exist, and their shell profile never runs. Without that export the icon fails **silently**: the window flashes and closes, with no error anyone can read. Then `cd` to the backtalk folder and run `./run.sh`. Make the file executable, and warn them once that the first double-click may ask permission; that is macOS being protective, click Open.
 
-**Windows (`.bat`):** `cd /d` to the backtalk folder and run `uv run python -m backtalk.main`. Windows `.bat` files inherit the user's PATH, so no export is needed there.
+**Windows (`.bat`):** `cd /d` to the backtalk folder and run `uv run python -m backtalk.main`. Windows `.bat` files inherit the user's PATH, so no export is needed there. End the file with an error hold so a crash stays readable instead of the window vanishing: `if errorlevel 1 pause`.
 
 **Do NOT set this to run at login.** A voice line starting on every boot for someone who may use it occasionally is presumptuous, and a hidden autostart entry is exactly the shape antivirus flags. The icon is the whole feature: they click it when they want to talk.
 

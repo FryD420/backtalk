@@ -565,10 +565,32 @@ async def amain():
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
     loop.run_in_executor(None, warm_ears)
-    await brain.start()
-    async for _ in brain.ask_stream(
-            "Warmup ping - reply with the single word: ready"):
-        pass
+    # THE BRAIN CONNECT, guarded. This is the one startup step that
+    # needs a signed-in Claude Code, internet, and available usage.
+    # When it fails or hangs, the mouth still works, so SAY SO instead
+    # of dying silently with the face stuck on idle (a real field
+    # case: the greeting played, then nothing, and on Windows the
+    # window closed before anyone could read the error).
+    log("[backtalk] connecting the brain...")
+    try:
+        await asyncio.wait_for(brain.start(), 120)
+
+        async def _warmup():
+            async for _ in brain.ask_stream(
+                    "Warmup ping - reply with the single word: ready"):
+                pass
+        await asyncio.wait_for(_warmup(), 180)
+    except (Exception, asyncio.TimeoutError) as e:
+        kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
+                else f"failed: {e!r}"[:220])
+        log(f"[backtalk] BRAIN CONNECT {kind}")
+        mouth.say("Bad news. The voice and the face are fine, but I "
+                  "couldn't reach my brain, the Claude Code session. "
+                  "Check this window for the error. The usual causes: "
+                  "Claude Code isn't signed in, the internet is down, "
+                  "or the plan is out of usage.")
+        mouth.wait_done(timeout=30)
+        raise SystemExit(1)
     log("[backtalk] brain warm")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
@@ -803,6 +825,7 @@ async def amain():
         # without barge-in, while the mouth speaks.
         mic_gate = (lambda: _MIC["btn"]
                     or (not barge_in and mouth.speaking))
+        mic_fails = 0
         while True:
             if _MIC["gen"] != mic_gen_seen:
                 mic_gen_seen = _MIC["gen"]
@@ -833,7 +856,22 @@ async def amain():
                     return
                 continue
             if mic_fut is not None and mic_fut in done:
-                g, text = mic_fut.result(); mic_fut = None
+                try:
+                    g, text = mic_fut.result()
+                except Exception as e:
+                    mic_fut = None
+                    mic_fails += 1
+                    log(f"[ears] open mic failed ({mic_fails}): {e!r}")
+                    if mic_fails >= 3:
+                        _MIC["mode"] = "ptt"
+                        _MIC["gen"] += 1
+                        mic_fails = 0
+                        mouth.say("The open microphone keeps failing, "
+                                  "so I'm switching to push to talk. "
+                                  "Hold the key to reach me, and "
+                                  "check this window for the error.")
+                    continue
+                mic_fut = None
                 if g != _MIC["gen"]:
                     continue             # captured before a switch
                 if text and not await handle(text):
@@ -858,6 +896,11 @@ async def amain():
                 try:
                     text = await loop.run_in_executor(
                         None, lambda: record_held(ptt.is_held))
+                except Exception as e:
+                    log(f"[ears] record/transcribe failed: {e!r}")
+                    mouth.say("My ears hit an error. Check this "
+                              "window for the details.")
+                    text = None
                 finally:
                     _MIC["btn"] = False
                 mouth.ducker.speech_end(0.2)     # snap back fast on release
