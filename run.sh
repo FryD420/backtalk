@@ -27,4 +27,10 @@ if pkill -f "backtalk[.]main" 2>/dev/null; then
   echo "[backtalk] replaced a previous voice session"
   sleep 1   # let the old process release mic/speaker devices
 fi
+# Self-repair: reconcile the environment with the shipped package list
+# before launching (sub-second when already current). --inexact keeps
+# anything the person's agent added on purpose; a missing package
+# (a half-finished install, a drifted env) heals here instead of
+# crashing on import. If it fails (offline), launch anyway.
+uv sync -q --inexact 2>/dev/null || true
 exec uv run python -m backtalk.main "$@" 2> >(grep -vi "pkg_resources\|VIRTUAL_ENV" >&2)
