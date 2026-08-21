@@ -99,6 +99,9 @@ class WarmBrain:
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
+                # SDK default is 1 MB per stream-json message; a 1080p
+                # screenshot read is ~5 MB base64 and killed the session.
+                max_buffer_size=16 * 1024 * 1024,
                 resume=rid,
             )
         if resume:
