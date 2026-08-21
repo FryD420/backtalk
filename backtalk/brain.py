@@ -291,6 +291,13 @@ class WarmBrain:
                     buf = ""
                     if tail:
                         yield tail
+            elif t == "AssistantMessage":
+                # The complete message lands right as its tool calls
+                # run: print what the agent is DOING while the voice is
+                # quiet, so a long silence never reads as a dead line.
+                for b in getattr(msg, "content", []) or []:
+                    if type(b).__name__ == "ToolUseBlock":
+                        log(_tool_line(b.name, b.input))
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
@@ -299,6 +306,35 @@ class WarmBrain:
         tail = buf.strip()
         if tail:
             yield tail
+
+
+def _tool_line(name: str, inp) -> str:
+    """One terminal line per tool call — the file, command, pattern or
+    query that says what the agent is up to, not the raw JSON."""
+    inp = inp if isinstance(inp, dict) else {}
+    if name in ("Read", "Write", "Edit", "NotebookEdit"):
+        what = inp.get("file_path") or inp.get("notebook_path") or ""
+    elif name == "Bash":
+        what = inp.get("description") or inp.get("command") or ""
+    elif name in ("Grep", "Glob"):
+        what = inp.get("pattern") or ""
+        if inp.get("path"):
+            what = f"{what} in {inp['path']}"
+    elif name == "WebFetch":
+        what = inp.get("url") or ""
+    elif name == "WebSearch":
+        what = inp.get("query") or ""
+    elif name in ("Agent", "Task"):
+        what = inp.get("description") or ""
+    elif name == "Skill":
+        what = inp.get("skill") or ""
+    else:
+        what = ", ".join(f"{k}={str(v)[:40]}"
+                         for k, v in list(inp.items())[:3])
+    what = " ".join(str(what).split())
+    if len(what) > 100:
+        what = what[:97] + "..."
+    return f"[tool] {name}: {what}" if what else f"[tool] {name}"
 
 
 if __name__ == "__main__":
