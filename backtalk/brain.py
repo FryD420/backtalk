@@ -70,6 +70,10 @@ class WarmBrain:
         # went sideways mid-stream, the wrong moment to gamble on
         # reattaching. (Community proposal, issue #1.)
         self._resume_id = resume_id
+        # True once start() actually reattached to a saved conversation
+        # (main.py speaks a where-were-we recap instead of the silent
+        # warmup ping in that case).
+        self.resumed = False
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
@@ -109,6 +113,7 @@ class WarmBrain:
                 self._client = ClaudeSDKClient(options=_opts(resume))
                 await self._client.connect()
                 log(f"[brain] resumed session {resume[:8]}")
+                self.resumed = True
                 return
             except Exception as e:
                 # a stale or invalid saved session must never brick the

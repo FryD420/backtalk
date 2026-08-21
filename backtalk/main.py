@@ -288,7 +288,10 @@ def make_permission_gate(mouth):
 # from a community member's own build shared in the Discord.)
 CONSOLE_VERBS = {
     "clear":     ("clear the session", "clear the context",
-                  "clear context", "fresh slate", "slash clear"),
+                  "clear context", "fresh slate", "slash clear",
+                  # natural answers to the resumed-launch "continue or
+                  # start fresh?" question
+                  "start fresh", "new session", "start a new session"),
     "compact":   ("compact the session", "compact the context",
                   "compact context", "slash compact"),
     "deep":      ("switch to the deep model", "use the deep model",
@@ -315,6 +318,15 @@ CONSOLE_VERBS = {
                   "ask for permission again"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# Spoken in place of the silent warmup ping when a launch reattached to
+# the previous conversation (config: resume_last_session).
+RESUME_RECAP = (
+    "We just relaunched and reattached to this conversation. In two "
+    "short spoken sentences: say what we were in the middle of, then "
+    "ask whether I want to continue or start fresh. Don't do any work "
+    "yet. If I want fresh, I'll say 'start fresh'; otherwise I'll just "
+    "keep talking.")
 
 
 def console_match(text):
@@ -658,6 +670,12 @@ async def amain():
         await asyncio.wait_for(brain.start(), 120)
 
         async def _warmup():
+            if brain.resumed:
+                # Reattached to the last conversation: the warmup turn
+                # is spoken, so the person hears where they left off
+                # and can choose to continue or start over.
+                await speak_reply(brain, mouth, RESUME_RECAP)
+                return
             async for _ in brain.ask_stream(
                     "Warmup ping - reply with the single word: ready"):
                 pass
