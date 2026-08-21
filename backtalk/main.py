@@ -54,6 +54,7 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
 import json
+import os
 import queue
 import sys
 import threading
@@ -726,6 +727,15 @@ async def amain():
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
+            # A fresh start is also a fresh launch: drop the saved
+            # resume id so a relaunch right after comes up cold instead
+            # of reattaching to an empty conversation. The file is
+            # rewritten on the next completed turn.
+            try:
+                from backtalk.brain import SESSION_FILE
+                os.remove(SESSION_FILE)
+            except OSError:
+                pass
             say_after = "Cleared. Fresh slate."
         elif verb == "compact":
             mouth.say("Compacting. One moment.")
