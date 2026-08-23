@@ -33,6 +33,8 @@ import os
 import re
 import warnings
 
+import anyio
+
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 try:
@@ -267,8 +269,76 @@ class WarmBrain:
             await self._client.disconnect()
             self._client = None
 
+    def _drain_idle(self) -> bool:
+        """Throw away whatever a BACKGROUND turn left in the pipe.
+
+        THE OTHER OFF-BY-ONE: the agent can take turns nobody asked for
+        — background-task notifications (a finished Bash job, a Monitor
+        event, a timeout) wake the model while the mic is quiet, and it
+        answers. Nothing here is reading the stream at that moment, so
+        that answer (text + ResultMessage) sits buffered. The next real
+        question then pairs with it: the person hears the reply to the
+        notification, and every answer after that is one question late.
+        reset_turn can't see it (the turn wasn't ours, _dirty is False).
+        So before every query: pull everything already buffered, non-
+        blocking, and log what got dropped. Returns True when the last
+        drained message shows a background turn still in flight (text
+        without its ResultMessage) — the caller then waits for that
+        turn to finish before sending, or the same pairing breaks."""
+        q = getattr(self._client, "_query", None)
+        rx = getattr(q, "_message_receive", None)
+        if rx is None:
+            return False
+        n, open_turn, texts = 0, False, []
+        while True:
+            try:
+                m = rx.receive_nowait()
+            except anyio.WouldBlock:
+                break
+            except Exception:
+                break
+            t = m.get("type") if isinstance(m, dict) else None
+            if t in ("end", "error"):
+                # Lifecycle markers — put them back for receive_messages
+                # to handle; nothing after them matters.
+                try:
+                    q._message_send.send_nowait(m)
+                except Exception:
+                    pass
+                break
+            n += 1
+            if t == "result":
+                open_turn = False
+            elif t == "assistant":
+                open_turn = True
+                for b in (m.get("message", {}) or {}).get("content", []) or []:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        texts.append((b.get("text") or "").strip())
+            elif t in ("user", "stream_event"):
+                open_turn = True
+        if n:
+            log(f"[brain] dropped {n} buffered messages from a background "
+                f"turn (not spoken; see below)")
+            for x in texts:
+                if x:
+                    log(f"[brain] (unspoken) {x[:300]}")
+        return open_turn
+
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
+        if self._drain_idle():
+            # A background turn is mid-flight: let it finish (bounded)
+            # so our question can't pair with its ResultMessage.
+            async def _finish():
+                async for msg in self._client.receive_response():
+                    if type(msg).__name__ == "ResultMessage":
+                        break
+            try:
+                await asyncio.wait_for(_finish(), 30)
+                log("[brain] waited out an in-flight background turn")
+            except Exception:
+                log("[brain] background turn didn't finish in 30s — "
+                    "sending anyway")
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
