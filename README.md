@@ -56,7 +56,7 @@ Two engines, and the setup wizard offers you both instead of quietly defaulting.
 
 ## Give it a face (optional)
 
-backtalk writes tiny state files while it listens, thinks, and speaks, so anything can watch them and react in real time.
+backtalk writes tiny state files while it listens, thinks, and speaks, so anything can watch them and react in real time: `.voice_state`, `.voice_waveform`, `.voice_loading_pid`, plus `.voice_heartbeat` (unix time, rewritten every ~2 s while backtalk is alive — stale means dead or hung) and `.voice_activity` (JSON `{ts, turn_started, line}` naming what the agent is doing mid-turn, e.g. `Read: foo.py`; deleted when the turn ends). All in `signals_dir`.
 
 - **[ai-visualizer](https://github.com/jaredrhod/ai-visualizer)** is the matching face: four full-screen visualizers, including the living circuit board from my videos. Point its `bus_dir` at this folder (or set `signals_dir` here to its folder) and it performs your actual conversation, idling, listening, thinking, and speaking along with the voice.
 - **[barehands](https://github.com/jaredrhod/barehands)**: point `barehands_state_dir` at its `state/` folder and the on-screen ring becomes your agent's face, breathing while idle, spinning while thinking, and pulsing with the voice while it talks.

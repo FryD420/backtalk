@@ -647,6 +647,10 @@ async def amain():
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
+    # The bus heartbeat (.voice_heartbeat, every ~2 s) starts NOW, on
+    # this loop, so the face reads LINK LIVE from the first second of
+    # boot and LOST the moment this process dies or the loop wedges.
+    signals.heartbeat_start()
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -922,6 +926,7 @@ async def amain():
             return True
         signals.set_state("thinking")
         signals.static_start()
+        signals.turn_begin()     # .voice_activity: the turn clock starts
         # Clean the pipe: drain the interrupted turn's leftovers so the
         # new question can't pair with a stale ResultMessage. A gate
         # that fired in the meantime resolves first, or the drain would
@@ -1042,6 +1047,7 @@ async def amain():
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")
+        signals.heartbeat_stop()   # LINK reads LOST at once, not in 6 s
         await brain.stop()
         log("[backtalk] hung up")
 

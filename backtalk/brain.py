@@ -40,6 +40,7 @@ try:
 except ImportError:                       # older SDKs: nothing to silence
     CanUseToolShadowedWarning = None
 
+from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
@@ -271,54 +272,68 @@ class WarmBrain:
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
-        async for msg in self._client.receive_response():
-            t = type(msg).__name__
-            if t == "StreamEvent":
-                ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
-                    delta = ev.get("delta", {}) or {}
-                    if delta.get("type") == "text_delta":
-                        buf += delta.get("text", "")
-                        # emit any complete sentences
-                        while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
-                                break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
-                            if sentence:
-                                yield sentence
-                elif ev.get("type") == "content_block_stop":
-                    # End of a speech block (e.g. right before a tool
-                    # call): flush NOW. Without this, pre-tool filler
-                    # ("On it — let me grab that.") sits silent in the
-                    # buffer through the whole tool run, then plays
-                    # glued to the answer: long dead air, then two
-                    # thoughts at once.
-                    tail = buf.strip()
-                    buf = ""
-                    if tail:
-                        yield tail
-            elif t == "AssistantMessage":
-                # The complete message lands right as its tool calls
-                # run: print what the agent is DOING while the voice is
-                # quiet, so a long silence never reads as a dead line.
-                for b in getattr(msg, "content", []) or []:
-                    if type(b).__name__ == "ToolUseBlock":
-                        log(_tool_line(b.name, b.input))
-            elif t == "ResultMessage":
-                self._dirty = False    # turn fully consumed — pipe aligned
-                self._tally(msg)
-                self._remember_session(msg)
-                break
+        # The activity file on the bus is cleared in the finally: it
+        # covers the clean finish (ResultMessage), a cancelled turn (the
+        # interrupt lands at the await below and unwinds through here),
+        # and a failed one, so no stale "Read: foo.py" ever outlives its
+        # turn on the face.
+        try:
+            async for msg in self._client.receive_response():
+                t = type(msg).__name__
+                if t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            # emit any complete sentences
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    yield sentence
+                    elif ev.get("type") == "content_block_stop":
+                        # End of a speech block (e.g. right before a
+                        # tool call): flush NOW. Without this, pre-tool
+                        # filler ("On it — let me grab that.") sits
+                        # silent in the buffer through the whole tool
+                        # run, then plays glued to the answer: long
+                        # dead air, then two thoughts at once.
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            yield tail
+                elif t == "AssistantMessage":
+                    # The complete message lands right as its tool
+                    # calls run: print what the agent is DOING while
+                    # the voice is quiet, so a long silence never reads
+                    # as a dead line — and put the same line on the bus
+                    # so the face can show it.
+                    for b in getattr(msg, "content", []) or []:
+                        if type(b).__name__ == "ToolUseBlock":
+                            line = _tool_line(b.name, b.input,
+                                              prefix=False)
+                            log(f"[tool] {line}")
+                            signals.activity(line)
+                elif t == "ResultMessage":
+                    self._dirty = False  # turn fully consumed — aligned
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    break
+        finally:
+            signals.turn_end()
         tail = buf.strip()
         if tail:
             yield tail
 
 
-def _tool_line(name: str, inp) -> str:
-    """One terminal line per tool call — the file, command, pattern or
-    query that says what the agent is up to, not the raw JSON."""
+def _tool_line(name: str, inp, prefix: bool = True) -> str:
+    """One line per tool call — the file, command, pattern or query that
+    says what the agent is up to, not the raw JSON. prefix=True adds the
+    terminal's "[tool] " tag; the bare form goes on the signal bus."""
     inp = inp if isinstance(inp, dict) else {}
     if name in ("Read", "Write", "Edit", "NotebookEdit"):
         what = inp.get("file_path") or inp.get("notebook_path") or ""
@@ -342,7 +357,8 @@ def _tool_line(name: str, inp) -> str:
     what = " ".join(str(what).split())
     if len(what) > 100:
         what = what[:97] + "..."
-    return f"[tool] {name}: {what}" if what else f"[tool] {name}"
+    line = f"{name}: {what}" if what else name
+    return f"[tool] {line}" if prefix else line
 
 
 if __name__ == "__main__":
