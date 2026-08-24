@@ -187,10 +187,17 @@ def _stream_elevenlabs(text: str, timeout: float):
 _el_key_cache: str | None = None
 
 
+def _key_slot() -> str:
+    """The credential-store entry name, so someone who already keeps a key
+    under their own name points at it instead of storing a second copy."""
+    return str(CFG["elevenlabs"].get("key_slot") or "backtalk-elevenlabs")
+
+
 def _get_elevenlabs_key() -> str:
     """The API key, from the most secure store available — NEVER from a
     file in this repo. Lookup order:
-      1. macOS Keychain, item `backtalk-elevenlabs` — seed it once with:
+      1. macOS Keychain, item `backtalk-elevenlabs` by default (change it
+         with elevenlabs.key_slot) — seed it once with:
          security add-generic-password -a "$USER" -s backtalk-elevenlabs -T /usr/bin/security -w
          (it prompts for the secret; -T lets this code read it without a
          GUI prompt every launch)
@@ -208,7 +215,7 @@ def _get_elevenlabs_key() -> str:
     try:
         if sys.platform == "darwin":
             r = subprocess.run(["security", "find-generic-password",
-                                "-s", "backtalk-elevenlabs", "-w"],
+                                "-s", _key_slot(), "-w"],
                                capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
                 key = r.stdout.strip()
@@ -216,7 +223,7 @@ def _get_elevenlabs_key() -> str:
             from shutil import which
             if which("secret-tool"):
                 r = subprocess.run(["secret-tool", "lookup", "service",
-                                    "backtalk-elevenlabs"],
+                                    _key_slot()],
                                    capture_output=True, text=True, timeout=5)
                 if r.returncode == 0:
                     key = r.stdout.strip()
