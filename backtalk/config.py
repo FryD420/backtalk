@@ -149,6 +149,13 @@ DEFAULTS = {
     # breathes while idle, spins while thinking, pulses with the voice.
     # (github.com/jaredrhod/barehands)
     "barehands_state_dir": "",
+    # THE INBOX: a TCP port on 127.0.0.1 where any local program can
+    # hand this session a typed message — it becomes a first-class turn
+    # in the SAME conversation the microphone talks to, with a spoken
+    # reply. This is how a GUI types at your agent without starting a
+    # second, separate session. 0 = off (the default). Loopback only.
+    # Protocol: one JSON object per line, {"text": "..."}.
+    "inbox_port": 0,
     # Sound played while the agent thinks, so a long pause never reads as
     # a dead line. The bundled one ships in assets/; a relative path
     # resolves against this repo. Set "" to think in silence.

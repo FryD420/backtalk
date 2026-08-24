@@ -63,6 +63,21 @@ backtalk writes tiny state files while it listens, thinks, and speaks, so anythi
 
 Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (this), face (ai-visualizer), hands (barehands).
 
+### The inbox — type at your agent from another program
+
+Set `inbox_port` in `backtalk.json` (e.g. `8795`) and the running voice
+session listens on `127.0.0.1:<port>`. Anything local can hand it a
+message, and that message becomes a first-class turn in the **same**
+conversation the microphone is having — spoken reply and all. It is off
+by default, and it never binds anything but loopback.
+
+Send one JSON object per line:
+
+    {"text": "what's the status of the build?"}
+
+and read back `{"ok": true}`. Multi-line `text` arrives as one message,
+so a pasted block is one turn rather than twenty.
+
 ## The fine print that matters
 
 - **Usage:** every spoken turn is a real Claude Code turn, so a long voice session uses your plan the same way a long typing session does. The config pins the fast model tier on purpose; it's most of the speed, and it's the lighter draw.

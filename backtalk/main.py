@@ -60,6 +60,7 @@ import sys
 import threading
 import time
 
+from backtalk import inbox
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
@@ -718,6 +719,7 @@ async def amain():
     speak_task: asyncio.Task | None = None
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
+    inbox.start(typed_q, CFG.get("inbox_port", 0), log=log)
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
