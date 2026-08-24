@@ -574,16 +574,36 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
+def _defence(raw: str, in_fence: bool) -> tuple[str, bool]:
+    """Split out fenced-code content (Joe, 2026-08-24): everything between
+    ``` markers is for the DASHBOARD, not the mouth — pasted paths, markup,
+    whole listing bodies. Returns (speakable text, new fence state). State
+    persists across chunks because a fence usually opens in one sentence
+    chunk and closes many chunks later."""
+    parts = raw.split("```")
+    spoken, state = [], in_fence
+    for i, part in enumerate(parts):
+        if not state:
+            spoken.append(part)
+        if i < len(parts) - 1:
+            state = not state
+    return " ".join(spoken), state
+
+
 async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
     short sentences come out flat)."""
     t0 = time.time()
     first = True
+    in_fence = False
     batch: list[str] = []
 
     def emit(raw: str):
-        nonlocal first, batch
+        nonlocal first, batch, in_fence
+        # Fenced blocks are dashboard-only — never spoken (they still
+        # reach the transcript untouched; this only mutes the mouth).
+        raw, in_fence = _defence(raw, in_fence)
         # TTS hygiene: backticks, markdown fences and angle-bracket tag
         # syntax are never speakable — the mouth gets clean prose only.
         s = raw.replace("`", "").replace("<<", "").replace(">>", "").strip()
