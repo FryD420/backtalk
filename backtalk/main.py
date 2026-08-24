@@ -66,6 +66,8 @@ from backtalk.config import CFG
 from backtalk.ears import Ears, record_held, warm as warm_ears
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
+from backtalk.typed import clean_typed as _clean_typed
+from backtalk.typed import join_paste as _join_paste
 from backtalk.vlog import log
 
 NAME = CFG["name"]
@@ -401,21 +403,6 @@ def _spoken_usage(sess, ctx_usage):
 
 _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
-
-
-def _clean_typed(line: str) -> str:
-    """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
-    whitespace (copying from a CLI chat render drags bars along)."""
-    line = line.strip()
-    while line[:1] in ("▎", "│", ">"):
-        line = line[1:].lstrip()
-    return line
-
-
-def _join_paste(body: str) -> str:
-    """Pasted blob -> one clean message (gutters scrubbed, lines joined)."""
-    parts = [_clean_typed(l) for l in body.split("\n")]
-    return " ".join(" ".join(p for p in parts if p).split())
 
 
 def _typed_reader_pipe(q: "queue.Queue[str]", fd: int):
