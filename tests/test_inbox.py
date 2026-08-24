@@ -23,6 +23,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backtalk import inbox
 
+
+def free_port():
+    """Ask the OS for a currently-unused loopback port, then let it go.
+    Never a hardcoded port — a real session could be listening on one of
+    those, and stealing it would silently eat someone's typed turns."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
 # ---- 1. the pure parser
 text, err = inbox.handle_payload('{"text": "hello boss"}')
 assert err is None, err
@@ -48,8 +59,9 @@ assert inbox.start(q0, 0) is None, "port 0 must not bind"
 
 # ---- 3 & 5. end to end
 q = queue.Queue()
-port = inbox.start(q, 8795)
-assert port == 8795, port
+port_wanted = free_port()
+port = inbox.start(q, port_wanted)
+assert port == port_wanted, port
 
 def send(obj):
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
@@ -77,12 +89,13 @@ s.close()
 assert [q.get(timeout=5), q.get(timeout=5)] == ["alpha", "beta"]
 
 # ---- 6. connection cap and recovery
-# Monkeypatch MAX_CONNS and start a fresh listener on a different port
-inbox.MAX_CONNS = 2
-inbox._conn_limit = __import__('threading').Semaphore(inbox.MAX_CONNS)
+# The cap is per-listener (start()'s max_conns kwarg), not a module
+# global, so a smaller limit for this check never affects any other
+# listener in this process.
 q_cap = queue.Queue()
-port_cap = inbox.start(q_cap, 8797)
-assert port_cap == 8797, port_cap
+port_cap_wanted = free_port()
+port_cap = inbox.start(q_cap, port_cap_wanted, max_conns=2)
+assert port_cap == port_cap_wanted, port_cap
 
 # Open 2 connections and keep them open (don't close)
 conns = []

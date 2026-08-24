@@ -27,6 +27,7 @@ Multi-line text collapses into one message, so a pasted block is one turn.
 
 Loopback only, by construction, and off unless inbox_port is set.
 """
+import os
 import json
 import queue
 import socket
@@ -36,8 +37,6 @@ from backtalk.typed import clean_typed, join_paste
 
 MAX_LINE = 256 * 1024        # a generous paste; anything bigger is junk
 MAX_CONNS = 8                # one local GUI, not a web server; 8 is plenty
-
-_conn_limit = threading.Semaphore(MAX_CONNS)
 
 
 def handle_payload(raw: str):
@@ -111,11 +110,22 @@ def _accept_loop(srv, q, log, sem):
             except OSError:
                 pass
             continue
-        threading.Thread(target=_serve_conn, args=(conn, q, log, sem),
-                         daemon=True).start()
+        try:
+            threading.Thread(target=_serve_conn, args=(conn, q, log, sem),
+                             daemon=True).start()
+        except Exception as e:
+            # The thread never got a chance to run, so nobody else will
+            # release this permit or close this socket — do it here, or
+            # both leak and the accept loop dies silently besides.
+            sem.release()
+            try:
+                conn.close()
+            except OSError:
+                pass
+            log(f"[inbox] failed to start connection thread ({e})")
 
 
-def start(q: "queue.Queue[str]", port: int, log=print):
+def start(q: "queue.Queue[str]", port: int, log=print, max_conns=MAX_CONNS):
     """Bind 127.0.0.1:port and serve on a daemon thread. Returns the
     bound port, or None when disabled or unavailable. Never raises."""
     try:
@@ -124,17 +134,29 @@ def start(q: "queue.Queue[str]", port: int, log=print):
         return None
     if port <= 0:
         return None
+    sem = threading.Semaphore(max_conns)
     try:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # SO_REUSEADDR and Windows do not mix: on Windows it lets an
+        # unrelated process bind a port we are already listening on and
+        # steal every connection meant for us, instead of merely easing
+        # TIME_WAIT reuse like it does on POSIX. SO_EXCLUSIVEADDRUSE is
+        # the Windows opposite number — it makes a bind-to-our-port
+        # attempt from another process fail, which is what we want here.
+        if os.name == "nt":
+            excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if excl is not None:
+                srv.setsockopt(socket.SOL_SOCKET, excl, 1)
+        else:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", port))
-        srv.listen(8)
+        srv.listen(max_conns)
     except OSError as e:
         log(f"[inbox] could not listen on 127.0.0.1:{port} ({e}) — "
             f"typed input from other programs is off this session")
         return None
     try:
-        threading.Thread(target=_accept_loop, args=(srv, q, log, _conn_limit),
+        threading.Thread(target=_accept_loop, args=(srv, q, log, sem),
                          daemon=True).start()
         log(f"[inbox] listening on 127.0.0.1:{port}")
     except Exception as e:

@@ -67,9 +67,8 @@ Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (t
 
 Set `inbox_port` in `backtalk.json` (e.g. `8795`) and the running voice
 session listens on `127.0.0.1:<port>`. Anything local can hand it a
-message, and that message becomes a first-class turn in the **same**
-conversation the microphone is having — spoken reply and all. It is off
-by default, and it never binds anything but loopback.
+message, which is queued the same way a typed terminal line is. It is
+off by default, and it never binds anything but loopback.
 
 Send one JSON object per line:
 
@@ -77,6 +76,34 @@ Send one JSON object per line:
 
 and read back `{"ok": true}`. Multi-line `text` arrives as one message,
 so a pasted block is one turn rather than twenty.
+
+**`{"ok": true}` means queued, not "spoken as a turn."** The loop
+decides what a queued line actually does with it, and that depends on
+what backtalk is doing when it arrives: it can become a conversational
+turn with a spoken reply, but it can just as easily be consumed as the
+answer to a pending spoken permission check, as a voice-console verb
+("clear the session", "usage report", ...), as a hangup phrase, or be
+dropped unread if it lands while backtalk is shutting down. Don't build
+retry or echo logic on the assumption that `ok: true` guarantees a
+conversational reply is coming — it only guarantees the line was
+accepted and handed off.
+
+**Security: text you send here can control backtalk, not just talk to
+it.** The inbox feeds the exact same queue as the microphone and the
+terminal, so anything with local access to the port can do anything a
+typed or spoken line can do — including answering a pending permission
+gate (a line that says `yes` approves whatever backtalk just asked to
+do) and driving the voice console. In particular, sending the console
+phrase `stop asking for permission` followed by `confirm` flips
+`permission_mode` to `bypassPermissions` (auto-approve), and that
+change is written to `backtalk.json` and **survives a restart**. Only
+run software you trust on a machine where you'd trust it with your
+keyboard, and only enable `inbox_port` for programs you control.
+
+**Idle connections are closed after 60 seconds with no error frame** —
+just an EOF. A GUI that wants to hold a persistent socket open needs to
+detect the close and reconnect; there is no keepalive and no warning
+before the cut.
 
 ## The fine print that matters
 
