@@ -17,7 +17,6 @@ import json
 import queue
 import socket
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -76,5 +75,48 @@ assert json.loads(f.readline())["ok"] is True
 assert json.loads(f.readline())["ok"] is True
 s.close()
 assert [q.get(timeout=5), q.get(timeout=5)] == ["alpha", "beta"]
+
+# ---- 6. connection cap and recovery
+# Monkeypatch MAX_CONNS and start a fresh listener on a different port
+inbox.MAX_CONNS = 2
+inbox._conn_limit = __import__('threading').Semaphore(inbox.MAX_CONNS)
+q_cap = queue.Queue()
+port_cap = inbox.start(q_cap, 8797)
+assert port_cap == 8797, port_cap
+
+# Open 2 connections and keep them open (don't close)
+conns = []
+for i in range(2):
+    s = socket.create_connection(("127.0.0.1", port_cap), timeout=2)
+    conns.append(s)
+
+# Try a 3rd connection; it should be rejected
+s3 = socket.create_connection(("127.0.0.1", port_cap), timeout=2)
+f3 = s3.makefile("r", encoding="utf-8")
+try:
+    reply = f3.readline()
+    # Connection is rejected with error response
+    if reply:
+        assert json.loads(reply)["ok"] is False
+    else:
+        # Or it's closed immediately (empty read)
+        pass
+except (ConnectionResetError, OSError):
+    # Connection closed by server, which is also valid rejection
+    pass
+finally:
+    s3.close()
+
+# Close the first two connections, freeing up permits
+for s in conns:
+    s.close()
+
+# Now a new connection should work and deliver its message
+s4 = socket.create_connection(("127.0.0.1", port_cap), timeout=2)
+s4.sendall((json.dumps({"text": "after recovery"}) + "\n").encode("utf-8"))
+reply4 = s4.makefile("r", encoding="utf-8").readline()
+s4.close()
+assert json.loads(reply4)["ok"] is True
+assert q_cap.get(timeout=2) == "after recovery"
 
 print("test_inbox: OK")

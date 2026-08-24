@@ -35,6 +35,9 @@ import threading
 from backtalk.typed import clean_typed, join_paste
 
 MAX_LINE = 256 * 1024        # a generous paste; anything bigger is junk
+MAX_CONNS = 8                # one local GUI, not a web server; 8 is plenty
+
+_conn_limit = threading.Semaphore(MAX_CONNS)
 
 
 def handle_payload(raw: str):
@@ -55,10 +58,10 @@ def handle_payload(raw: str):
     return text, None
 
 
-def _serve_conn(conn, q, log):
+def _serve_conn(conn, q, log, sem):
     """One connection: read request lines until the peer goes away."""
     try:
-        conn.settimeout(300)
+        conn.settimeout(60)
         with conn, conn.makefile("rwb") as f:
             while True:
                 line = f.readline(MAX_LINE)
@@ -78,9 +81,11 @@ def _serve_conn(conn, q, log):
                 f.flush()
     except Exception:
         return          # a broken client must never reach the voice line
+    finally:
+        sem.release()
 
 
-def _accept_loop(srv, q, log):
+def _accept_loop(srv, q, log, sem):
     while True:
         try:
             conn, addr = srv.accept()
@@ -94,7 +99,19 @@ def _accept_loop(srv, q, log):
             except OSError:
                 pass
             continue
-        threading.Thread(target=_serve_conn, args=(conn, q, log),
+        if not sem.acquire(blocking=False):
+            log("[inbox] connection limit reached, rejecting")
+            try:
+                reply = {"ok": False, "error": "connection limit reached"}
+                conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            except OSError:
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        threading.Thread(target=_serve_conn, args=(conn, q, log, sem),
                          daemon=True).start()
 
 
@@ -116,7 +133,16 @@ def start(q: "queue.Queue[str]", port: int, log=print):
         log(f"[inbox] could not listen on 127.0.0.1:{port} ({e}) — "
             f"typed input from other programs is off this session")
         return None
-    threading.Thread(target=_accept_loop, args=(srv, q, log),
-                     daemon=True).start()
-    log(f"[inbox] listening on 127.0.0.1:{port}")
+    try:
+        threading.Thread(target=_accept_loop, args=(srv, q, log, _conn_limit),
+                         daemon=True).start()
+        log(f"[inbox] listening on 127.0.0.1:{port}")
+    except Exception as e:
+        try:
+            srv.close()
+        except OSError:
+            pass
+        log(f"[inbox] failed to start listener thread ({e}) — "
+            f"typed input from other programs is off this session")
+        return None
     return port
