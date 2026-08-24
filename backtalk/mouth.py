@@ -276,15 +276,19 @@ class Mouth:
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
-            self._q.put(s)
+            self._q.put((s, None))
 
-    def say_chunk(self, text: str):
+    def say_chunk(self, text: str, directions=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
-        dull)."""
+        dull).
+
+        `directions` are the stage directions this chunk carried. They are
+        published on the signal bus when this chunk's audio STARTS, which
+        is why they travel with it instead of firing at parse time."""
         text = text.strip()
         if text:
-            self._q.put(text)
+            self._q.put((text, directions or None))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -313,7 +317,8 @@ class Mouth:
     def _run(self):
         from backtalk import signals
         while True:
-            sentence = self._q.get()
+            item = self._q.get()
+            sentence, directions = item if isinstance(item, tuple) else (item, None)
             if not sentence:
                 continue
             self._stop.clear()
@@ -322,12 +327,15 @@ class Mouth:
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence)
+                self._play_stream(sentence, directions)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
                 if self._q.empty():
                     self._speaking.clear()
+                    # The reply has genuinely stopped talking, as opposed to
+                    # the gap between two sentences of the same reply.
+                    signals.reply_done()
                     self.ducker.speech_end()
                     signals.set_state("idle")
 
@@ -370,7 +378,7 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, block: int = 2205,
+    def _play_stream(self, sentence: str, directions=None, block: int = 2205,
                      prebuffer_s: float = 0.75):
         """Stream-synthesize and play with the head-start buffer (audio
         law #2). stop() reacts ~50ms. The sample rate comes from
@@ -390,6 +398,12 @@ class Mouth:
             return
         try:
             out = self._get_out(rate)
+            # AUDIO STARTS HERE: the head buffer is full and the first write
+            # is next. Publishing now is what puts a screen cue on the spoken
+            # word rather than seconds ahead of it.
+            if directions:
+                from backtalk import signals as _sig
+                _sig.direction(directions)
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):
