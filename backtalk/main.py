@@ -64,6 +64,7 @@ from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import Ears, record_held, warm as warm_ears
+from backtalk import mouth as mouth_mod
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -663,6 +664,12 @@ async def amain():
             resume_id = None
 
     mouth = Mouth()
+    # Start loading the voice NOW, explicitly, rather than letting the
+    # render loop trigger it lazily on the first queued line. Nothing is
+    # queued until it is warm (see below), so without this the load would
+    # never begin. Kept out of Mouth.__init__ on purpose: constructing a
+    # Mouth should not drag Kokoro into a unit test.
+    mouth_mod.start_warming()
     ears = Ears()
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
@@ -678,7 +685,20 @@ async def amain():
     log(f"[backtalk] up — agent={NAME} dir={CFG['agent_dir']} "
         f"model={brain.model} mic={mode} "
         f"(say 'goodbye {NAME.lower()}' to hang up)")
-    mouth.say(CFG["greeting"])
+    # NOTHING is queued into a cold voice. The TTS pipeline takes ~30 s
+    # to load, and a talk-key press in that window calls shut_up(), which
+    # flushes the queue — so on 2026-08-26 the greeting AND the resume
+    # recap were both destroyed without ever making a sound, and the
+    # session looked mute. Speech now waits for the voice to be real,
+    # which also means a press during warm-up destroys nothing, because
+    # there is nothing queued yet to destroy.
+    def _greet_when_warm():
+        if mouth_mod.wait_warm(180):
+            mouth.say(CFG["greeting"])
+        else:
+            log("[mouth] voice never finished loading; greeting skipped")
+    threading.Thread(target=_greet_when_warm, daemon=True,
+                     name="greet-when-warm").start()
 
     loop = asyncio.get_event_loop()
     # Warm the engines while the greeting plays: the STT model load and
@@ -699,6 +719,11 @@ async def amain():
                 # Reattached to the last conversation: the warmup turn
                 # is spoken, so the person hears where they left off
                 # and can choose to continue or start over.
+                #
+                # Wait for the voice first. The brain is usually warm
+                # well before the TTS pipeline is, and a recap spoken
+                # into a cold mouth is a recap nobody hears.
+                await asyncio.to_thread(mouth_mod.wait_warm, 180)
                 await speak_reply(brain, mouth, RESUME_RECAP)
                 return
             async for _ in brain.ask_stream(
