@@ -89,6 +89,31 @@ def _ensure_espeak():
             break
 
 
+# Set the moment the TTS pipeline can actually render a word. Anything
+# queued before this fires waits ~30 s in silence, and on this machine a
+# talk-key press in that window flushes the queue — so the greeting and
+# the resume recap were silently destroyed before they ever played
+# (2026-08-26). Callers use wait_warm() to hold speech until it is real.
+_warm_event = threading.Event()
+
+
+def is_warm() -> bool:
+    """True once the voice can actually speak."""
+    return _warm_event.is_set()
+
+
+def wait_warm(timeout: float | None = None) -> bool:
+    """Block until the voice is loaded. False on timeout."""
+    return _warm_event.wait(timeout)
+
+
+def start_warming():
+    """Begin loading the voice NOW, in the background, without needing
+    something queued first. Cheap to call twice — warm() is idempotent
+    under its lock."""
+    threading.Thread(target=warm, daemon=True, name="mouth-warm").start()
+
+
 def warm():
     """Load the Kokoro pipeline (first call downloads the model to the
     HF cache). Called at startup while the greeting text is composed."""
@@ -105,6 +130,7 @@ def warm():
                 f"voice {CFG['voice']})...")
             _pipe = KPipeline(lang_code=lang)
             log("[mouth] voice ready")
+        _warm_event.set()
     return _pipe
 
 
