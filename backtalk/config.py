@@ -132,15 +132,23 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
-    # Which microphone, matched on part of its NAME (case-insensitive).
-    # "" uses the system default, which is right on almost every machine.
+    # The microphone to record from, matched by NAME. "" means whatever
+    # the OS calls the default input, which is right on most machines.
     #
-    # A name and never an index, deliberately: plugging a USB microphone
-    # in mid-session RESHUFFLES the audio library's index table. Measured
-    # here, the default pair moved from [-1, 1] to [1, 3], which silently
-    # changed the OUTPUT device too. A number written down today points
-    # at a different device tomorrow; a name still means what it said.
-    "input_device": "",
+    # Set a real device name to PIN the mic, so a headset connecting for
+    # OUTPUT cannot steal your input -- which also keeps a Bluetooth
+    # headset in high-quality A2DP instead of dropping it to the
+    # narrowband call profile mid-sentence, degrading what you hear at
+    # the same moment it takes your voice.
+    #
+    # A name and never an index: indices shift every time a device
+    # connects or disconnects, the exact event this setting exists to
+    # survive. Exact name wins, then the first case-insensitive
+    # substring. A name matching nothing falls back to the default and
+    # logs the inputs it did find; the mic degrades, it never goes mute.
+    #
+    # NOT "stt_device" below, which is the Whisper COMPUTE device.
+    "mic_device": "",
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the

@@ -80,26 +80,68 @@ def _mlx_repo(model_name: str) -> str:
 _mic_checked = False
 
 
-def _input_device():
-    """The configured input device, or None for the system default.
+_mic_device_warned = False
 
-    Matched by NAME, never by index, and that is deliberate: plugging a
-    USB microphone in mid-session RESHUFFLES sounddevice's index table.
-    Measured on a real machine, the default pair moved from [-1, 1] to
-    [1, 3] -- which silently changed the OUTPUT device too. Anything
-    pinned to a number points somewhere else the moment hardware moves.
+
+def _mic_index():
+    """Resolve mic_device (a device NAME) to an index, or None for the default.
+
+    A NAME and never an index, because indices shift every time a device
+    connects or disconnects, which is the exact event this setting exists
+    to survive. Measured on a real machine: plugging a USB microphone in
+    moved the default pair from [-1, 1] to [1, 3], silently changing the
+    OUTPUT device too.
+
+    Re-resolved on every stream open rather than cached at startup, for
+    the same reason. Exact name wins, then the first case-insensitive
+    substring, so a precise name can never be beaten by a loose one.
     """
-    want = str(CFG.get("input_device", "")).strip().lower()
+    global _mic_device_warned
+    want = str(CFG.get("mic_device", "") or "").strip()
     if not want:
         return None
     try:
-        for i, d in enumerate(sd.query_devices()):
-            if d.get("max_input_channels", 0) > 0 and want in d["name"].lower():
-                return i
-    except Exception:
+        devices = sd.query_devices()
+    except Exception as e:
+        log(f"[ears] could not list audio devices ({e}) -- using the "
+            f"default mic")
         return None
-    log(f"[ears] no input device matching {want!r} -- using the default")
+    ins = [(i, d) for i, d in enumerate(devices)
+           if d.get("max_input_channels", 0) > 0]
+    for i, d in ins:
+        if d["name"] == want:
+            _mic_device_warned = False
+            return i
+    low = want.lower()
+    for i, d in ins:
+        if low in d["name"].lower():
+            _mic_device_warned = False
+            return i
+    if not _mic_device_warned:          # once per disappearance, not per press
+        _mic_device_warned = True
+        log(f"[ears] mic_device {want!r} not found -- using the system "
+            f"default. Inputs I can see: {[d['name'] for _, d in ins]}")
     return None
+
+
+def _open_mic():
+    """Open the capture stream on the configured mic.
+
+    Degrades to the system default if that device will not open --
+    unplugged between the lookup and the open, busy, or refusing the
+    sample rate. The mic gets worse; it never goes mute.
+    """
+    dev = _mic_index()
+    opts = dict(samplerate=RATE, channels=1, dtype="int16",
+                blocksize=FRAME_LEN)
+    try:
+        return sd.InputStream(device=dev, **opts)
+    except Exception as e:
+        if dev is None:
+            raise                      # the default itself failed; real problem
+        log(f"[ears] could not open mic_device {CFG.get('mic_device')!r} "
+            f"({e}) -- using the system default")
+        return sd.InputStream(**opts)
 
 
 _mic_warned = False
@@ -121,7 +163,7 @@ def _mic_message(detail: str) -> list[str]:
         "[ears] plug one in and start the voice line again. If one IS "
         "plugged in, check it is allowed in this system's microphone "
         "privacy settings -- and if you have several, put part of the "
-        "one you want in \"input_device\" in backtalk.json.",
+        "one you want in \"mic_device\" in backtalk.json.",
     ]
 
 
@@ -178,7 +220,7 @@ def check_microphone() -> bool:
         return True
     _mic_checked = True
     try:
-        sd.check_input_settings(device=_input_device(), channels=1,
+        sd.check_input_settings(device=_mic_index(), channels=1,
                                 samplerate=RATE, dtype="int16")
         return True
     except Exception as e:
@@ -293,8 +335,7 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_LEN) as stream:
+        with _open_mic() as stream:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
@@ -341,8 +382,7 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                        blocksize=FRAME_LEN) as stream:
+    with _open_mic() as stream:
         while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())
