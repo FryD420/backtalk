@@ -77,11 +77,136 @@ def _mlx_repo(model_name: str) -> str:
     return f"mlx-community/whisper-{model_name}-mlx"
 
 
+_mic_checked = False
+
+
+def _input_device():
+    """The configured input device, or None for the system default.
+
+    Matched by NAME, never by index, and that is deliberate: plugging a
+    USB microphone in mid-session RESHUFFLES sounddevice's index table.
+    Measured on a real machine, the default pair moved from [-1, 1] to
+    [1, 3] -- which silently changed the OUTPUT device too. Anything
+    pinned to a number points somewhere else the moment hardware moves.
+    """
+    want = str(CFG.get("input_device", "")).strip().lower()
+    if not want:
+        return None
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) > 0 and want in d["name"].lower():
+                return i
+    except Exception:
+        return None
+    log(f"[ears] no input device matching {want!r} -- using the default")
+    return None
+
+
+_mic_warned = False
+
+# Substrings PortAudio uses when the problem is the DEVICE rather than the
+# audio. Matched on the message because the exception TYPE is the same
+# PortAudioError whether a device vanished or a stream merely glitched.
+_DEVICE_ERROR_HINTS = ("error querying device", "invalid device",
+                       "device unavailable", "no default input",
+                       "invalid number of channels", "device not found")
+
+
+def _mic_message(detail: str) -> list[str]:
+    """The one explanation, so startup and mid-session say the same thing."""
+    return [
+        "[ears] NO WORKING MICROPHONE. Nothing can be recorded on this "
+        "machine, so the talk key will have nothing to send.",
+        f"[ears] the audio system said: {detail}",
+        "[ears] plug one in and start the voice line again. If one IS "
+        "plugged in, check it is allowed in this system's microphone "
+        "privacy settings -- and if you have several, put part of the "
+        "one you want in \"input_device\" in backtalk.json.",
+    ]
+
+
+def explain_audio_failure(exc) -> bool:
+    """Turn a device-level audio failure into plain words. Returns True
+    when it handled the message, so the caller can skip the raw repr.
+
+    The startup pre-flight cannot cover a microphone that is unplugged or
+    dies MID-SESSION, and that person gets the worst version of this:
+    no warning at all, and a raw PortAudioError on every single press,
+    forever. The key hook keeps working throughout, so it still looks
+    like it is listening. This says the same sentences the pre-flight
+    would have said, at the moment it becomes true.
+
+    Said in full once, then briefly, because a message repeated on every
+    key press stops being information and becomes noise.
+    """
+    global _mic_warned
+    text = str(exc).lower()
+    # THE TWO HALVES OF THIS TEST ARE NOT DOING THE SAME JOB. Do not
+    # simplify it to one. Measured on Windows: the SAME missing microphone
+    # produces "Error querying device -1" when it is absent at startup and
+    # "A device ID has been used that is out of range for your system
+    # [MME error 2]" when it is unplugged mid-stream. The second matches
+    # not one hint below, and was caught only by the type check -- on the
+    # very first real test of the case this function exists for. The
+    # hints catch device failures raised as something other than a
+    # PortAudioError; the type catches PortAudio wording nobody predicted.
+    if type(exc).__name__ != "PortAudioError" and \
+            not any(h in text for h in _DEVICE_ERROR_HINTS):
+        return False
+    if _mic_warned:
+        log("[ears] still no working microphone.")
+        return True
+    _mic_warned = True
+    for line in _mic_message(f"{type(exc).__name__}: {exc}"):
+        log(line)
+    return True
+
+
+def check_microphone() -> bool:
+    """Say whether recording is possible at all, BEFORE the greeting.
+
+    Without this the voice line boots on a machine with no microphone,
+    warms, speaks its greeting and presents a working push-to-talk
+    prompt. The key hook works perfectly throughout, so the user is
+    given every impression it is listening -- and the only sign of
+    trouble is a raw PortAudioError AFTER they have held the key and
+    spoken. It then repeats forever, because holding a key again cannot
+    conjure a device.
+    """
+    global _mic_checked
+    if _mic_checked:
+        return True
+    _mic_checked = True
+    try:
+        sd.check_input_settings(device=_input_device(), channels=1,
+                                samplerate=RATE, dtype="int16")
+        return True
+    except Exception as e:
+        global _mic_warned
+        _mic_warned = True      # said it here; do not repeat on first press
+        for line in _mic_message(str(e)):
+            log(line)
+        return False
+
+
+def _probe(model):
+    """Run a tenth of a second of silence through the real path.
+
+    faster-whisper is lazy: transcribe() returns a generator and does no
+    work until it is iterated, so the list() is what actually exercises
+    the backend and is not redundant.
+    """
+    segments, _ = model.transcribe(np.zeros(RATE // 10, dtype=np.float32),
+                                   language="en")
+    list(segments)
+
+
 def warm():
     """Load the STT model (first call downloads it to the HF cache).
     Called at startup while the greeting plays, so the first real
     utterance doesn't pay the load."""
     global _model, _backend
+    check_microphone()
     with _model_lock:
         if _model is None:
             if _apple_gpu_available():
@@ -97,11 +222,34 @@ def warm():
                 _model, _backend = repo, "mlx"
             else:
                 from faster_whisper import WhisperModel
+                want = CFG["stt_device"]
                 log(f"[ears] loading {CFG['stt_model']} "
-                    f"({CFG['stt_device']}/{CFG['stt_compute']})...")
-                _model = WhisperModel(CFG["stt_model"],
-                                      device=CFG["stt_device"],
+                    f"({want}/{CFG['stt_compute']})...")
+                _model = WhisperModel(CFG["stt_model"], device=want,
                                       compute_type=CFG["stt_compute"])
+                # PROVE the device before the greeting, not at the first
+                # spoken sentence. WhisperModel CONSTRUCTS perfectly well
+                # against a GPU it cannot actually use: "auto" picks CUDA
+                # on any NVIDIA machine, and the CUDA runtime is not
+                # loaded until the first inference. So warm-up logged
+                # "model ready", startup reported healthy, and a missing
+                # cublas DLL only surfaced when the user finally spoke --
+                # long after the greeting, in a place they could not
+                # connect to a setting. The Apple-GPU branch above has
+                # always done this; this one never did.
+                try:
+                    _probe(_model)
+                except Exception as e:
+                    if want == "cpu":
+                        raise
+                    log(f"[ears] {want!r} does not work on this machine "
+                        f"({type(e).__name__}: {e}).")
+                    log("[ears] falling back to the CPU. Set "
+                        "\"stt_device\": \"cpu\" in backtalk.json to skip "
+                        "this check in future.")
+                    _model = WhisperModel(CFG["stt_model"], device="cpu",
+                                          compute_type=CFG["stt_compute"])
+                    _probe(_model)
                 _backend = "faster-whisper"
             log(f"[ears] model ready ({_backend})")
     return _model
