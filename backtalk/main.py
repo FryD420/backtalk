@@ -109,9 +109,18 @@ _MIC = {"mode": "ptt", "gen": 0, "btn": False}
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
 # fail. Anything that is not an exact yes DENIES, with the words passed
 # back to the agent as the reason. Deny is always the default.
+# Exact matches only, and the reason is in the comment on _norm_speech:
+# prefix matching turns "yesterday" and "yes or no" into consent. So the
+# set has to actually CONTAIN what people say -- and the phrase somebody
+# reaches for is the one the prompt just put in their head. Asking for
+# PERMISSION and then denying "permission granted" is the system tripping
+# a user with its own vocabulary, and it quotes their words back as the
+# reason for the refusal.
 _YES = {"yes", "yeah", "yep", "yup", "sure", "approve", "approved",
         "go ahead", "do it", "yes please", "yes sir", "yes boss",
-        "yes go ahead", "go for it", "green light", "okay", "ok", "y"}
+        "yes go ahead", "go for it", "green light", "okay", "ok", "y",
+        "permission granted", "granted", "you have permission",
+        "you may", "allowed", "allow it", "confirmed", "affirmative"}
 _CHAIN_MARKS = ("&&", "||", ";", "|", "$(", "`", "\n")
 
 
