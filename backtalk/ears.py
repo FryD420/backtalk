@@ -137,11 +137,37 @@ def _open_mic():
     try:
         return sd.InputStream(device=dev, **opts)
     except Exception as e:
-        if dev is None:
-            raise                      # the default itself failed; real problem
-        log(f"[ears] could not open mic_device {CFG.get('mic_device')!r} "
-            f"({e}) -- using the system default")
-        return sd.InputStream(**opts)
+        if dev is not None:
+            log(f"[ears] could not open mic_device {CFG.get('mic_device')!r} "
+                f"({e}) -- using the system default")
+            try:
+                return sd.InputStream(**opts)
+            except Exception:
+                pass                   # fall through to the rebuild below
+        return _reopen_after_device_change(opts)
+
+
+def _reopen_after_device_change(opts):
+    """Last resort: rebuild the audio system, then open the mic once more.
+
+    PortAudio caches the device list when it initialises, so a device that
+    disappears afterwards leaves a stale entry behind. A Bluetooth headset
+    flipping between listening and call modes does this every time the mic
+    opens, and from then on EVERY capture fails while the voice line looks
+    perfectly healthy and simply never hears another word.
+
+    Rebuilding refreshes the list. It also closes every open stream, the
+    speaking one included, which is why Mouth._get_out rebuilds a stream
+    it finds dead rather than trusting the one it is holding. Do not
+    remove that guard without removing this.
+    """
+    log("[ears] the audio devices changed -- rebuilding and reopening")
+    try:
+        sd._terminate()
+    except Exception:
+        pass                           # already down; re-initialising is the point
+    sd._initialize()
+    return sd.InputStream(**opts)
 
 
 _mic_warned = False

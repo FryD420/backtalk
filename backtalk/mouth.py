@@ -421,9 +421,19 @@ class Mouth:
         sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
         rare, costs at most one blip on the switch)."""
         if self._out is not None and self._out_rate == rate:
-            if not self._out.active:
-                self._out.start()
-            return self._out
+            # Guarded, because the stream can die UNDER us: the ears
+            # rebuild the whole audio system to recover from a device
+            # change (see ears._reopen_after_device_change), and that
+            # closes every open stream including this one. Touching a
+            # dead stream raises rather than returning False, so the
+            # check has to be the try, not an `if`. Falling through
+            # rebuilds it, which is what the rest of this method does.
+            try:
+                if not self._out.active:
+                    self._out.start()
+                return self._out
+            except Exception:
+                log("[mouth] the output stream went away, reopening")
         self._drop_out()
         self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
         self._out_rate = rate
