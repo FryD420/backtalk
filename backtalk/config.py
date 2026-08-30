@@ -115,6 +115,12 @@ DEFAULTS = {
     # A resume that fails falls back to a fresh session and says so in
     # the log. (Grew out of the same community proposal, issue #1.)
     "resume_last_session": False,
+    # Publish your Claude usage (the five-hour and weekly windows) on the
+    # signal bus so a face can draw it. OFF by default and deliberately
+    # so: this is your own account spend, and the faces this feeds are
+    # frequently on a stream or a shared screen. Nothing is collected at
+    # all while this is false. (Community fix, ai-visualizer issue #1.)
+    "show_usage": False,
     # Reasoning effort for the voice session: "" inherits the model's
     # default; "low" / "medium" / "high" / "max" applies at launch.
     # Saying "set effort to X" in a voice session saves itself here.

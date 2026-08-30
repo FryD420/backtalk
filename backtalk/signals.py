@@ -23,6 +23,8 @@ is the whole integration surface:
   .voice_state        idle | listening | thinking | speaking
   .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
   .voice_loading_pid  exists while the thinking sound is playing
+  .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
+                      written when show_usage is on
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -50,6 +52,7 @@ _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
+_RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -137,6 +140,36 @@ def reply_done():
     try:
         with open(_REPLY_DONE_FILE, "w") as f:
             f.write(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+_rate_limits: dict = {}
+
+
+def set_rate_limit(window: str, utilization, resets_at):
+    """One usage window's reading — how much of the plan is spent.
+
+    Merged rather than replaced, because the reading arrives one window
+    at a time and a face wants to draw both at once. `utilization` is a
+    0..1 fraction (or None when the window has not reported a number
+    yet, which is a real state and not an error); `resets_at` is a unix
+    epoch.
+
+    NOTHING CALLS THIS UNLESS show_usage IS ON. That is a privacy
+    default, not a performance one: this is the account holder's own
+    spend, and it renders on a face that may well be pointed at a
+    camera. It never appears without being asked for. (Community fix,
+    ai-visualizer issue #1.)
+
+    Never raises."""
+    if not window:
+        return
+    _rate_limits[window] = {"utilization": utilization,
+                            "resets_at": resets_at}
+    try:
+        with open(_RATE_LIMIT_FILE, "w") as f:
+            f.write(json.dumps(_rate_limits))
     except OSError:
         pass
 
