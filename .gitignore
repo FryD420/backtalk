@@ -13,3 +13,12 @@ uv.lock
 backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates
 backtalk.json
+
+# Other agents' configs living beside this one. They are not backtalk's, they are
+# not the user's copy of backtalk's, and nothing here should ever carry them.
+earl.json
+show.json
+# A pinned interpreter version is this machine's, never the downloader's.
+.python-version
+# Config backups the setup wizard leaves behind.
+*.json.*.bak
