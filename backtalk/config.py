@@ -28,7 +28,11 @@ import os
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CONFIG_PATH = REPO / "backtalk.json"
+# One install, more than one assistant. Point BACKTALK_CONFIG at a different
+# JSON file and you get a second agent (its own name, voice, folder and
+# greeting) without a second copy of the code. A launcher exports it; nothing
+# else changes.
+CONFIG_PATH = Path(os.environ.get("BACKTALK_CONFIG") or (REPO / "backtalk.json"))
 
 DEFAULTS = {
     # The folder whose CLAUDE.md defines WHO your agent is. The voice
@@ -70,6 +74,15 @@ DEFAULTS = {
     # behaves as "ask" (a headless voice session could never render
     # the terminal prompt it promised).
     "permission_mode": "ask",
+    # Which of your agent's skills the voice session can SEE. null keeps the
+    # CLI's own default (all of them). [] hides every one. A list names the
+    # ones to allow.
+    #
+    # This matters on a shared screen. Skill DESCRIPTIONS live in the system
+    # prompt, so if yours name clients, employers or systems, they are one
+    # screen-share away from an audience. A context filter, not a sandbox:
+    # it decides what the session is TOLD about, not what it can reach.
+    "visible_skills": None,
     # Extra folders the agent may access beyond agent_dir (e.g. your
     # notes vault). Absolute paths or ~ paths.
     "extra_dirs": [],
@@ -102,6 +115,12 @@ DEFAULTS = {
     # A resume that fails falls back to a fresh session and says so in
     # the log. (Grew out of the same community proposal, issue #1.)
     "resume_last_session": False,
+    # Publish your Claude usage (the five-hour and weekly windows) on the
+    # signal bus so a face can draw it. OFF by default and deliberately
+    # so: this is your own account spend, and the faces this feeds are
+    # frequently on a stream or a shared screen. Nothing is collected at
+    # all while this is false. (Community fix, ai-visualizer issue #1.)
+    "show_usage": False,
     # Reasoning effort for the voice session: "" inherits the model's
     # default; "low" / "medium" / "high" / "max" applies at launch.
     # Saying "set effort to X" in a voice session saves itself here.
@@ -119,6 +138,23 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # The microphone to record from, matched by NAME. "" means whatever
+    # the OS calls the default input, which is right on most machines.
+    #
+    # Set a real device name to PIN the mic, so a headset connecting for
+    # OUTPUT cannot steal your input -- which also keeps a Bluetooth
+    # headset in high-quality A2DP instead of dropping it to the
+    # narrowband call profile mid-sentence, degrading what you hear at
+    # the same moment it takes your voice.
+    #
+    # A name and never an index: indices shift every time a device
+    # connects or disconnects, the exact event this setting exists to
+    # survive. Exact name wins, then the first case-insensitive
+    # substring. A name matching nothing falls back to the default and
+    # logs the inputs it did find; the mic degrades, it never goes mute.
+    #
+    # NOT "stt_device" below, which is the Whisper COMPUTE device.
+    "mic_device": "",
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the
@@ -129,7 +165,14 @@ DEFAULTS = {
     "elevenlabs": {
         "enabled": False,
         "voice_id": "",
+        # Purely for you. Voice IDs are unreadable six months later, so put
+        # the human name here; nothing reads it.
+        "voice_note": "",
         "model": "eleven_turbo_v2_5",
+        # Which OS credential-store entry holds the key. Change it if you
+        # already keep an ElevenLabs key under a name of your own rather
+        # than seeding a second copy of the same secret.
+        "key_slot": "backtalk-elevenlabs",
         # Local mastering: ElevenLabs' site previews are mastered demo
         # clips and the raw API never matches them. This chain closes
         # the gap: presence lift, light chest, broadcast compression,
@@ -162,7 +205,15 @@ DEFAULTS = {
     "thinking_sound": "assets/thinking.wav",
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
+    # Spoken instead of "greeting" when mic_mode is "open", where telling
+    # someone to hold a key is wrong. Leave "" to use "greeting" for both.
+    "greeting_open_mic": "",
     "signoff": "Voice line closing. I'll be here when you need me.",
+    # Appended to the spoken-delivery discipline below. The discipline covers
+    # the MEDIUM (write for the ear, no markdown, keep it short); your agent's
+    # CLAUDE.md covers the character. Use this for a note that belongs to
+    # neither, e.g. a rule that only applies when it is speaking.
+    "discipline_append": "",
 }
 
 # The spoken-delivery discipline — the MEDIUM half of what used to be a
@@ -179,7 +230,12 @@ DISCIPLINE = (
     "sentences; go longer only when the question genuinely needs it. "
     "No markdown, no lists, no code blocks, no emoji, no URLs. Say "
     "numbers the way a human says them out loud — never raw figures "
-    "or symbols. Skip any startup sequence; answer directly. "
+    "or symbols. NEVER SPEAK A FILE PATH: say the file, not its "
+    "address. 'the config' or 'ears dot py', never a string of "
+    "slashes and folder names read one by one — it is unbearable "
+    "aloud and carries no meaning by ear. Same for URLs and long "
+    "ids: name the thing, not the address. "
+    "Skip any startup sequence; answer directly. "
     "VOICE CONSOLE FACTS, answer from these whenever the person asks "
     "you to change a voice-line setting: this session is controlled "
     "by exact spoken phrases, never by you. Permissions: 'stop "
@@ -228,6 +284,9 @@ def load() -> dict:
         f"hang up {low}", "hang up"))
     key_label = "the " + str(cfg.get("ptt_key", "home")).replace("_", " ") \
                 + " key"
+    # In hands-free there is no key to hold, so a separate line can be set.
+    if str(cfg.get("mic_mode", "ptt")) == "open" and cfg.get("greeting_open_mic"):
+        cfg["greeting"] = cfg["greeting_open_mic"]
     cfg["greeting"] = str(cfg["greeting"]).replace(
         "{name}", name).replace("{ptt_key}", key_label)
     cfg["signoff"] = str(cfg["signoff"]).replace("{name}", name)
@@ -235,3 +294,7 @@ def load() -> dict:
 
 
 CFG = load()
+
+# The character half stays in YOUR agent's CLAUDE.md. This is the medium.
+if CFG.get("discipline_append"):
+    DISCIPLINE = DISCIPLINE + " " + str(CFG["discipline_append"]).strip()

@@ -28,6 +28,8 @@ is the whole integration surface:
   .voice_activity     JSON {ts, turn_started, line} — what the agent is
                       doing RIGHT NOW during a turn ("Read: foo.py");
                       deleted when the turn ends
+  .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
+                      written when show_usage is on
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work. The heartbeat and activity files are how a face
@@ -59,6 +61,9 @@ _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _HEARTBEAT_FILE = os.path.join(_DIR, ".voice_heartbeat")
 _ACTIVITY_FILE = os.path.join(_DIR, ".voice_activity")
+_DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
+_REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
+_RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -112,6 +117,72 @@ def feed_waveform(pcm: np.ndarray):
     except (OSError, ValueError):
         pass
     set_state("speaking")
+
+
+def direction(items):
+    """Stage directions the agent wrote into its reply, published at the
+    moment the audio carrying them starts playing.
+
+    Your agent can emit `<<anything>>` inline and backtalk will never speak
+    it. What the tag MEANS is deliberately not backtalk's business: it
+    publishes the raw strings and something else decides. That is the whole
+    reason this is a file and not a plugin API.
+
+    The timing is the point, and it is the one part a watcher cannot do for
+    itself: these fire when the sentence becomes AUDIBLE, not when the model
+    generated it. A screen cue lands on the spoken word instead of seconds
+    early. Never raises."""
+    if not items:
+        return
+    try:
+        with open(_DIRECTION_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "directions": list(items)}))
+    except OSError:
+        pass
+
+
+def reply_done():
+    """One reply has finished speaking and its audio has fully drained.
+
+    Distinct from the state going idle, which also happens in the gaps
+    BETWEEN sentences of the same reply. Anything waiting for the agent to
+    genuinely stop talking wants this rather than a state flicker. Never
+    raises."""
+    try:
+        with open(_REPLY_DONE_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
+
+
+_rate_limits: dict = {}
+
+
+def set_rate_limit(window: str, utilization, resets_at):
+    """One usage window's reading — how much of the plan is spent.
+
+    Merged rather than replaced, because the reading arrives one window
+    at a time and a face wants to draw both at once. `utilization` is a
+    0..1 fraction (or None when the window has not reported a number
+    yet, which is a real state and not an error); `resets_at` is a unix
+    epoch.
+
+    NOTHING CALLS THIS UNLESS show_usage IS ON. That is a privacy
+    default, not a performance one: this is the account holder's own
+    spend, and it renders on a face that may well be pointed at a
+    camera. It never appears without being asked for. (Community fix,
+    ai-visualizer issue #1.)
+
+    Never raises."""
+    if not window:
+        return
+    _rate_limits[window] = {"utilization": utilization,
+                            "resets_at": resets_at}
+    try:
+        with open(_RATE_LIMIT_FILE, "w") as f:
+            f.write(json.dumps(_rate_limits))
+    except OSError:
+        pass
 
 
 def _player_cmd(path: str) -> list[str] | None:

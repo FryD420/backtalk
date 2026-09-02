@@ -1,0 +1,34 @@
+        async for msg in self._client.receive_response():
+            t = type(msg).__name__
+            if t == "StreamEvent":
+                ev = getattr(msg, "event", {}) or {}
+                if ev.get("type") == "content_block_delta":
+                    delta = ev.get("delta", {}) or {}
+                    if delta.get("type") == "text_delta":
+                        buf += delta.get("text", "")
+                        # emit any complete sentences
+                        while True:
+                            m = _SENTENCE_END.search(buf)
+                            if not m:
+                                break
+                            sentence, buf = (buf[:m.end()].strip(),
+                                             buf[m.end():])
+                            if sentence:
+                                yield sentence
+                elif ev.get("type") == "content_block_stop":
+                    # End of a speech block (e.g. right before a tool
+                    # call): flush NOW. Without this, pre-tool filler
+                    # ("On it — let me grab that.") sits silent in the
+                    # buffer through the whole tool run, then plays
+                    # glued to the answer: long dead air, then two
+                    # thoughts at once.
+                    tail = buf.strip()
+                    buf = ""
+                    if tail:
+                        yield tail
+            elif t == "ResultMessage":
+                self._dirty = False    # turn fully consumed — pipe aligned
+                self._tally(msg)
+                self._remember_session(msg)
+                await self._pull_rate_limits()
+                break

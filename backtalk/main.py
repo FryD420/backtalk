@@ -56,6 +56,8 @@ import asyncio
 import json
 import os
 import queue
+import re
+import socket
 import sys
 import threading
 import time
@@ -64,7 +66,8 @@ from backtalk import inbox
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
-from backtalk.ears import Ears, record_held, warm as warm_ears
+from backtalk.ears import (Ears, explain_audio_failure, record_held,
+                           warm as warm_ears)
 from backtalk import mouth as mouth_mod
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
@@ -111,9 +114,18 @@ _MIC = {"mode": "ptt", "gen": 0, "btn": False}
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
 # fail. Anything that is not an exact yes DENIES, with the words passed
 # back to the agent as the reason. Deny is always the default.
+# Exact matches only, and the reason is in the comment on _norm_speech:
+# prefix matching turns "yesterday" and "yes or no" into consent. So the
+# set has to actually CONTAIN what people say -- and the phrase somebody
+# reaches for is the one the prompt just put in their head. Asking for
+# PERMISSION and then denying "permission granted" is the system tripping
+# a user with its own vocabulary, and it quotes their words back as the
+# reason for the refusal.
 _YES = {"yes", "yeah", "yep", "yup", "sure", "approve", "approved",
         "go ahead", "do it", "yes please", "yes sir", "yes boss",
-        "yes go ahead", "go for it", "green light", "okay", "ok", "y"}
+        "yes go ahead", "go for it", "green light", "okay", "ok", "y",
+        "permission granted", "granted", "you have permission",
+        "you may", "allowed", "allow it", "confirmed", "affirmative"}
 _CHAIN_MARKS = ("&&", "||", ";", "|", "$(", "`", "\n")
 
 
@@ -407,6 +419,17 @@ _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
 
 
+# <<anything>> is a stage direction: lifted out, never spoken, published on
+# the bus when the audio carrying it starts. Bounded so a runaway model cannot
+# swallow a paragraph into one "tag".
+_DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
+
+# NOTE, merge 2026-09-02: upstream also defines _clean_typed/_join_paste
+# right here. They are byte-for-byte the functions this branch already
+# imports from backtalk/typed.py (lines near the top), where they were
+# extracted so the typed inbox could share them without importing main.
+# Ours kept, theirs dropped as a duplicate - not as a disagreement.
+
 def _typed_reader_pipe(q: "queue.Queue[str]", fd: int):
     """Non-tty stdin (pipes/tests): line assembly with paste markers."""
     import os
@@ -587,33 +610,51 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     first = True
     in_fence = False
     batch: list[str] = []
+    pending: list[str] = []          # directions waiting for their chunk
 
     def emit(raw: str):
-        nonlocal first, batch, in_fence
-        # Fenced blocks are dashboard-only — never spoken (they still
+        nonlocal first, batch, in_fence, pending
+        # Fenced blocks are dashboard-only - never spoken (they still
         # reach the transcript untouched; this only mutes the mouth).
+        # OURS, kept: upstream has no equivalent.
         raw, in_fence = _defence(raw, in_fence)
-        # TTS hygiene: backticks, markdown fences and angle-bracket tag
-        # syntax are never speakable — the mouth gets clean prose only.
-        s = raw.replace("`", "").replace("<<", "").replace(">>", "").strip()
+        # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
+        # lifted out here, never spoken, and published on the signal bus when
+        # this chunk's audio starts (signals.direction). backtalk has no
+        # opinion on what a direction means; something watching the bus does.
+        #
+        # THEIRS, taken over ours: this branch used to strip only the angle
+        # brackets, which left the tag BODY in the sentence for the TTS to
+        # read aloud. Lifting the whole tag out is strictly better, and it
+        # publishes the direction instead of throwing it away.
+        found = _DIRECTION_TAG.findall(raw)
+        if found:
+            pending += [d.strip() for d in found if d.strip()]
+        raw = _DIRECTION_TAG.sub(" ", raw)
+        # TTS hygiene: backticks and markdown fences are never speakable.
+        s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
             return
         if first:
-            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}")
-            mouth.say_chunk(s)
+            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
+                + (f"  <directions: {pending}>" if pending else ""))
+            mouth.say_chunk(s, pending)
+            pending = []
             first = False
         else:
-            log(f"[{NAME}] {s}")
+            log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch))
+                mouth.say_chunk(" ".join(batch), pending)
+                pending = []
                 batch = []
 
     try:
         async for sentence in brain.ask_stream(text):
             emit(sentence)
         if batch:
-            mouth.say_chunk(" ".join(batch))
+            mouth.say_chunk(" ".join(batch), pending)
+            pending = []
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
@@ -1023,7 +1064,8 @@ async def amain():
                 except Exception as e:
                     mic_fut = None
                     mic_fails += 1
-                    log(f"[ears] open mic failed ({mic_fails}): {e!r}")
+                    if not explain_audio_failure(e):
+                        log(f"[ears] open mic failed ({mic_fails}): {e!r}")
                     if mic_fails >= 3:
                         _MIC["mode"] = "ptt"
                         _MIC["gen"] += 1
@@ -1059,9 +1101,19 @@ async def amain():
                     text = await loop.run_in_executor(
                         None, lambda: record_held(ptt.is_held))
                 except Exception as e:
-                    log(f"[ears] record/transcribe failed: {e!r}")
-                    mouth.say("My ears hit an error. Check this "
-                              "window for the details.")
+                    # A device-level failure gets plain words instead of a
+                    # raw exception. The pre-flight at startup cannot catch
+                    # a microphone unplugged mid-session, and that is the
+                    # case where the old message was worst: jargon, on
+                    # every press, with the key hook still working so it
+                    # looked like it was listening.
+                    if explain_audio_failure(e):
+                        mouth.say("I can't hear you. There's no working "
+                                  "microphone I can use.")
+                    else:
+                        log(f"[ears] record/transcribe failed: {e!r}")
+                        mouth.say("My ears hit an error. Check this "
+                                  "window for the details.")
                     text = None
                 finally:
                     _MIC["btn"] = False
@@ -1086,7 +1138,51 @@ async def amain():
         log("[backtalk] hung up")
 
 
+# Loopback port used purely as a mutex. Nothing is ever served on it.
+_INSTANCE_PORT = 8791
+_instance_lock = None
+
+
+def _claim_single_instance() -> bool:
+    """Refuse to be the second voice line on this machine, out loud.
+
+    Two instances both hold the keyboard hook and both open the
+    microphone, and the result looks EXACTLY like a broken talk key:
+    presses register, the audio goes to whichever process won the
+    device, and the loser reports an ignored tap. Nothing warned about
+    it, so a user who double-clicks the Talk icon twice concludes the
+    product is broken. The tell, when it was finally caught, was the
+    same sentence transcribed twice at an identical timestamp.
+
+    A bound socket is the mutex rather than a pid file, because the
+    operating system releases it when this process dies HOWEVER it dies.
+    A pid file outlives a crash or a force-kill and then lies about a
+    process that is long gone, which is the failure it would exist to
+    prevent.
+    """
+    global _instance_lock
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # No SO_REUSEADDR here on purpose: reuse is exactly what would let a
+    # second instance bind alongside the first and defeat the whole point.
+    try:
+        s.bind(("127.0.0.1", _INSTANCE_PORT))
+        s.listen(1)
+    except OSError:
+        s.close()
+        return False
+    _instance_lock = s
+    return True
+
+
 def main():
+    if not _claim_single_instance():
+        print("[backtalk] ANOTHER VOICE LINE IS ALREADY RUNNING on this "
+              "machine, so this one is stopping.", flush=True)
+        print("[backtalk] Two of them fight over the microphone and the "
+              "talk key, which looks exactly like the talk key being "
+              "broken. Use the window that is already open, or close it "
+              "and start again.", flush=True)
+        sys.exit(1)
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:

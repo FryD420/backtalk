@@ -1,0 +1,53 @@
+        # The activity file on the bus is cleared in the finally: it
+        # covers the clean finish (ResultMessage), a cancelled turn (the
+        # interrupt lands at the await below and unwinds through here),
+        # and a failed one, so no stale "Read: foo.py" ever outlives its
+        # turn on the face.
+        try:
+            async for msg in self._client.receive_response():
+                t = type(msg).__name__
+                if t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            # emit any complete sentences
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    yield sentence
+                    elif ev.get("type") == "content_block_stop":
+                        # End of a speech block (e.g. right before a
+                        # tool call): flush NOW. Without this, pre-tool
+                        # filler ("On it — let me grab that.") sits
+                        # silent in the buffer through the whole tool
+                        # run, then plays glued to the answer: long
+                        # dead air, then two thoughts at once.
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            yield tail
+                elif t == "AssistantMessage":
+                    # The complete message lands right as its tool
+                    # calls run: print what the agent is DOING while
+                    # the voice is quiet, so a long silence never reads
+                    # as a dead line — and put the same line on the bus
+                    # so the face can show it.
+                    for b in getattr(msg, "content", []) or []:
+                        if type(b).__name__ == "ToolUseBlock":
+                            line = _tool_line(b.name, b.input,
+                                              prefix=False)
+                            log(f"[tool] {line}")
+                            signals.activity(line)
+                elif t == "ResultMessage":
+                    self._dirty = False  # turn fully consumed — aligned
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    break
+        finally:
+            signals.turn_end()

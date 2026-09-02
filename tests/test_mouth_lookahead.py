@@ -26,9 +26,16 @@ import backtalk  # noqa: E402
 
 # Stub the signal bus and the ducker: file writes and OS mixer calls
 # have no place in a unit check.
+# reply_done and direction arrived with the 2026-09-02 upstream merge:
+# the mouth now marks the end of a whole reply on the bus, and publishes a
+# chunk's stage directions the moment its audio starts. A fake that does
+# not implement them kills the player thread on the first completed reply
+# - which is exactly how this test caught the gap.
 _sig = types.SimpleNamespace(static_stop=lambda: None,
                              set_state=lambda s: None,
-                             feed_waveform=lambda p: None)
+                             feed_waveform=lambda p: None,
+                             reply_done=lambda: None,
+                             direction=lambda d: None)
 sys.modules["backtalk.signals"] = _sig
 backtalk.signals = _sig
 
