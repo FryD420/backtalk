@@ -25,6 +25,7 @@ adds is the spoken-delivery discipline below, which is about the MEDIUM
 """
 import json
 import os
+import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -254,8 +255,30 @@ DISCIPLINE = (
 )
 
 
+_missing_vars_warned = set()
+
+
 def _expand(p: str) -> str:
-    return os.path.expanduser(p) if p else p
+    """Expand ~ and environment variables in a configured path.
+
+    Environment variables, not just ~, because the agent folder and the
+    vault do not live under the user profile --- and hardcoding a drive
+    letter is exactly what stops this config working on a second machine.
+
+    An undefined variable is left verbatim and reported ONCE. It never
+    raises: a path that cannot resolve must produce a readable complaint,
+    not a dead voice line on startup.
+    """
+    if not p:
+        return p
+    out = os.path.expandvars(os.path.expanduser(p))
+    for token in re.findall(r"%([A-Za-z_][A-Za-z0-9_]*)%", out):
+        if token not in _missing_vars_warned:
+            _missing_vars_warned.add(token)
+            print(f"[config] path {p!r} references undefined environment "
+                  f"variable %{token}% — leaving it as written, which will "
+                  f"almost certainly fail later", flush=True)
+    return out
 
 
 def load() -> dict:
