@@ -72,29 +72,92 @@ SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 RESUME_MAX_AGE_S = 4 * 3600
 
 
-def load_resume_id(path: str | None = None, now: float | None = None,
-                   max_age_s: float = RESUME_MAX_AGE_S) -> str | None:
-    """The saved session id, but only while it is still worth resuming.
+# Where a REFUSED conversation waits. The gate above is a good default
+# and a blunt one: a long working session that ran past the window is
+# exactly the one you most want back. So the escape hatch needs the id,
+# and it cannot go and read it later — _remember_session overwrites
+# SESSION_FILE with the NEW id on the first completed turn, seconds
+# after launch. By the time anyone could ask, the answer is gone.
+# (Recovering it by hand on 2026-09-03 meant renaming the file BEFORE
+# saying a word to the agent.) So it is parked here at the moment of
+# refusal, beside the session file and out of the new session's way.
+DECLINED_SUFFIX = ".declined"
 
-    Returns None for every flavour of "start fresh": no file, an empty
-    one, an unreadable one, or one that has gone cold. A launch must
-    never die over a bookkeeping file, so nothing here raises."""
+
+def declined_path(path: str | None = None) -> str:
+    """Where the refused conversation's id is parked."""
+    return (path or SESSION_FILE) + DECLINED_SUFFIX
+
+
+def resume_decision(path: str | None = None, now: float | None = None,
+                    max_age_s: float = RESUME_MAX_AGE_S
+                    ) -> tuple[str | None, str | None, float | None]:
+    """What to reattach to, what was refused, and how old it was.
+
+    Returns (resume_id, declined_id, age_s). Exactly one of the first
+    two is ever set: a session is either warm enough to take or too cold
+    and handed back for the escape hatch. Both are None when there is
+    nothing saved at all, which is a first launch, not a decision.
+
+    Nothing here raises. A launch must never die over a bookkeeping
+    file."""
     path = path or SESSION_FILE
     try:
         with open(path) as f:
             sid = f.read().strip()
         mtime = os.path.getmtime(path)
     except OSError:
-        return None
+        return None, None, None
     if not sid:
-        return None
+        return None, None, None
     age = (time.time() if now is None else now) - mtime
     if age > max_age_s:
         log(f"[brain] last session is {age / 3600:.1f}h old — starting "
             f"fresh rather than replaying it (limit "
             f"{max_age_s / 3600:.0f}h)")
+        return None, sid, age
+    return sid, None, age
+
+
+def load_resume_id(path: str | None = None, now: float | None = None,
+                   max_age_s: float = RESUME_MAX_AGE_S) -> str | None:
+    """The saved session id, but only while it is still worth resuming.
+
+    Returns None for every flavour of "start fresh": no file, an empty
+    one, an unreadable one, or one that has gone cold."""
+    return resume_decision(path, now, max_age_s)[0]
+
+
+def park_declined(sid: str | None, path: str | None = None) -> None:
+    """Hold a refused conversation where the escape hatch can find it.
+
+    Overwrites: you want the last thing you lost, not the first. Silent
+    on failure — a launch must not die because a sidecar would not
+    write, it just means the hatch has nothing in it."""
+    if not sid:
+        return
+    try:
+        with open(declined_path(path), "w") as f:
+            f.write(sid)
+    except OSError:
+        pass
+
+
+def load_declined(path: str | None = None) -> str | None:
+    """The conversation the last launch refused, if it is still there."""
+    try:
+        with open(declined_path(path)) as f:
+            return f.read().strip() or None
+    except OSError:
         return None
-    return sid
+
+
+def clear_declined(path: str | None = None) -> None:
+    """Empty the hatch once it has been used."""
+    try:
+        os.remove(declined_path(path))
+    except OSError:
+        pass
 
 
 async def warmup_or_fresh(brain, mouth, warmup, timeout: float = 180) -> bool:
@@ -229,6 +292,22 @@ class WarmBrain:
                     pass
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
+
+    async def reattach(self, sid: str):
+        """Swap this live brain onto an older conversation.
+
+        The escape hatch behind the resume gate: the gate refused a cold
+        session at launch, and the person wants it anyway. Goes through
+        the ordinary start() path on purpose, so the resume-failed
+        fallback there still applies — if the old conversation will not
+        load, this comes up fresh rather than leaving no brain at all.
+
+        Whatever was said since launch stays behind; the caller says so
+        out loud before calling this."""
+        await self.stop()
+        self._resume_id = sid
+        self.resumed = False
+        await self.start()
 
     async def set_permission_mode(self, backtalk_mode: str):
         """Live flip, no reconnect, conversation intact ("ask" maps to

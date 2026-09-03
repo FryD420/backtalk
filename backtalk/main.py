@@ -64,7 +64,8 @@ import time
 
 from backtalk import inbox
 from backtalk import signals
-from backtalk.brain import WarmBrain, load_resume_id, warmup_or_fresh
+from backtalk.brain import (WarmBrain, clear_declined, load_declined,
+                            park_declined, resume_decision, warmup_or_fresh)
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -309,6 +310,12 @@ CONSOLE_VERBS = {
                   # natural answers to the resumed-launch "continue or
                   # start fresh?" question
                   "start fresh", "new session", "start a new session"),
+    # the escape hatch behind the resume gate: a conversation the gate
+    # refused at launch, pulled back on request
+    "reattach": ("bring back the last conversation",
+                 "bring back the last session",
+                 "bring it back", "reattach anyway",
+                 "restore the last conversation"),
     "compact":   ("compact the session", "compact the context",
                   "compact context", "slash compact"),
     "deep":      ("switch to the deep model", "use the deep model",
@@ -685,8 +692,16 @@ async def amain():
     # resume_last_session: reattach to the saved conversation — but only
     # while it is still WARM. An overnight session is a cold replay of
     # everything, which is how the voice line spent the morning of
-    # 2026-09-03 dead; see load_resume_id in brain.py.
-    resume_id = load_resume_id() if CFG.get("resume_last_session") else None
+    # 2026-09-03 dead; see resume_decision in brain.py.
+    #
+    # When the gate refuses one, PARK IT before the new conversation
+    # overwrites the id (first completed turn, seconds from now) — the
+    # spoken "bring back the last conversation" needs it to still exist.
+    if CFG.get("resume_last_session"):
+        resume_id, declined_id, declined_age = resume_decision()
+        park_declined(declined_id)
+    else:
+        resume_id = declined_id = declined_age = None
 
     mouth = Mouth()
     # Start loading the voice NOW, explicitly, rather than letting the
@@ -718,10 +733,22 @@ async def amain():
     # which also means a press during warm-up destroys nothing, because
     # there is nothing queued yet to destroy.
     def _greet_when_warm():
-        if mouth_mod.wait_warm(180):
-            mouth.say(CFG["greeting"])
-        else:
+        if not mouth_mod.wait_warm(180):
             log("[mouth] voice never finished loading; greeting skipped")
+            return
+        mouth.say(CFG["greeting"])
+        # A REFUSED conversation is announced, because the gate just made
+        # a decision on the person's behalf and a silent fresh start
+        # looks identical to a resumed one. Only ever spoken when
+        # something was actually dropped — a first launch has nothing to
+        # report and says nothing.
+        if declined_id:
+            hrs = (declined_age or 0) / 3600
+            howold = (f"{hrs:.0f} hours old" if hrs >= 1
+                      else f"{(declined_age or 0) / 60:.0f} minutes old")
+            mouth.say(f"Starting a new conversation. The last one was "
+                      f"{howold}, so I let it go. Say bring back the last "
+                      f"conversation if you want it.")
     threading.Thread(target=_greet_when_warm, daemon=True,
                      name="greet-when-warm").start()
 
@@ -821,6 +848,39 @@ async def amain():
             except OSError:
                 pass
             say_after = "Cleared. Fresh slate."
+        elif verb == "reattach":
+            # THE ESCAPE HATCH behind the resume gate. The gate refused a
+            # cold conversation at launch and said so; this pulls it back
+            # anyway, for the long working session that ran past the
+            # window and is exactly the one worth having.
+            resp = ""
+            sid = load_declined()
+            if not sid:
+                mouth.say("There's no dropped conversation to bring back. "
+                          "This one is all we've got.")
+            else:
+                mouth.say("Bringing back the last conversation. Anything "
+                          "we've said since launch stays behind. One "
+                          "moment.")
+                try:
+                    # This IS the expensive cold replay that killed the
+                    # voice line on 2026-09-03. Asked for deliberately
+                    # this time — and still never allowed to be fatal.
+                    await asyncio.wait_for(brain.reattach(sid), 180)
+                except (Exception, asyncio.TimeoutError) as e:
+                    log(f"[console] reattach failed: {e!r}"[:220])
+                    try:
+                        await brain.reattach(None)   # come back up empty
+                    except Exception:
+                        pass
+                    mouth.say("That conversation wouldn't load. It's the "
+                              "same cold replay that broke things this "
+                              "morning, so I've left it. I'm on a fresh "
+                              "one and the vault still has the details.")
+                else:
+                    clear_declined()
+                    log(f"[console] reattached to {sid[:8]} on request")
+                    await speak_reply(brain, mouth, RESUME_RECAP)
         elif verb == "compact":
             mouth.say("Compacting. One moment.")
             resp = await brain.command("/compact")
