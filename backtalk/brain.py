@@ -31,6 +31,7 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
@@ -51,6 +52,103 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
+
+# How stale a saved conversation may be and still be worth reattaching
+# to. Four hours: long enough to cover a relaunch, lunch, or a crash
+# mid-afternoon; short enough that "yesterday" never qualifies.
+#
+# WHY THERE IS A LIMIT AT ALL (2026-09-03). resume_last_session reattached
+# to whatever id was last written, however old. Overnight that id had
+# grown into a 2,345-entry, 4.2 MB conversation, and the next morning's
+# launch tried to replay the whole thing through an expired prompt cache
+# — the most expensive request this machine makes. It did not come back
+# inside the startup guard, four launches running, and the voice line was
+# dead all morning.
+#
+# The feature earns its keep on the warm case and is kept. What changed
+# is that a COLD session is now a fresh start instead of a gamble: the
+# vault carries yesterday, not the transcript, so nothing is actually
+# lost by letting it go.
+RESUME_MAX_AGE_S = 4 * 3600
+
+
+def load_resume_id(path: str | None = None, now: float | None = None,
+                   max_age_s: float = RESUME_MAX_AGE_S) -> str | None:
+    """The saved session id, but only while it is still worth resuming.
+
+    Returns None for every flavour of "start fresh": no file, an empty
+    one, an unreadable one, or one that has gone cold. A launch must
+    never die over a bookkeeping file, so nothing here raises."""
+    path = path or SESSION_FILE
+    try:
+        with open(path) as f:
+            sid = f.read().strip()
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if not sid:
+        return None
+    age = (time.time() if now is None else now) - mtime
+    if age > max_age_s:
+        log(f"[brain] last session is {age / 3600:.1f}h old — starting "
+            f"fresh rather than replaying it (limit "
+            f"{max_age_s / 3600:.0f}h)")
+        return None
+    return sid
+
+
+async def warmup_or_fresh(brain, mouth, warmup, timeout: float = 180) -> bool:
+    """Run the startup warmup, and never let it kill the voice line.
+
+    The warmup is a pleasantry — a silent ping on a fresh session, the
+    spoken where-were-we recap on a reattached one. It is not the
+    product, and it has no business being fatal.
+
+    Until 2026-09-03 it was: a warmup that ran long called SystemExit(1)
+    and took the mic, the inbox on 8795 and the GUI's whole data feed
+    with it. The instinct behind that was sound — an earlier bug had the
+    greeting play and then nothing happen, silently — so this keeps the
+    loud and drops the dying. It says what went wrong, drops the
+    reattachment that is the usual culprit, comes up on a fresh
+    conversation, and lets the person talk.
+
+    A failed CONNECT is a different thing and stays fatal upstream: no
+    brain at all means nothing works. Returns True if the warmup
+    completed, False if it was abandoned."""
+    try:
+        await asyncio.wait_for(warmup(), timeout)
+        return True
+    except (Exception, asyncio.TimeoutError) as e:
+        kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
+                else f"failed: {e!r}"[:220])
+        log(f"[backtalk] startup warmup {kind} — the voice line stays up")
+
+    if not brain.resumed:
+        # Nothing to drop. The connection is live, so this is most
+        # likely the model being slow or an upstream incident; say so
+        # and let the person ask their question anyway.
+        mouth.say("Heads up. My brain didn't answer on the way up, so the "
+                  "first thing you ask me might be slow or fail. The voice "
+                  "and the face are fine. The log has the error.")
+        return False
+
+    log("[backtalk] dropping the reattachment and starting fresh")
+    try:
+        try:
+            await asyncio.wait_for(brain.stop(), 15)
+        except Exception:
+            pass          # a wedged connection must not block the rescue
+        brain.resumed = False
+        await asyncio.wait_for(brain.start(), 120)
+        mouth.say("I couldn't pick up where we left off — that conversation "
+                  "was too big to reload. I've started a fresh one. "
+                  "Everything from last time is in the vault.")
+    except (Exception, asyncio.TimeoutError) as e:
+        log(f"[backtalk] fresh restart failed: {e!r}"[:220])
+        mouth.say("I couldn't pick up where we left off, and the fresh "
+                  "start didn't take either. The voice and the face are "
+                  "fine. The log has the error.")
+    return False
 
 
 class WarmBrain:

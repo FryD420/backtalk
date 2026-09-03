@@ -64,7 +64,7 @@ import time
 
 from backtalk import inbox
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brain import WarmBrain, load_resume_id, warmup_or_fresh
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -682,15 +682,11 @@ async def amain():
     _AUTOAPPROVE["on"] = CFG_BOOT_MODE == "bypassPermissions"
     _MIC["mode"] = "open" if (open_mic
                               or CFG.get("mic_mode") == "open") else "ptt"
-    # resume_last_session: reattach to the saved conversation, if any
-    resume_id = None
-    if CFG.get("resume_last_session"):
-        try:
-            from backtalk.brain import SESSION_FILE
-            with open(SESSION_FILE) as f:
-                resume_id = f.read().strip() or None
-        except OSError:
-            resume_id = None
+    # resume_last_session: reattach to the saved conversation — but only
+    # while it is still WARM. An overnight session is a cold replay of
+    # everything, which is how the voice line spent the morning of
+    # 2026-09-03 dead; see load_resume_id in brain.py.
+    resume_id = load_resume_id() if CFG.get("resume_last_session") else None
 
     mouth = Mouth()
     # Start loading the voice NOW, explicitly, rather than letting the
@@ -739,26 +735,14 @@ async def amain():
     # of dying silently with the face stuck on idle (a real field
     # case: the greeting played, then nothing, and on Windows the
     # window closed before anyone could read the error).
+    #
+    # 2026-09-03: the CONNECT and the WARMUP used to share one guard,
+    # so a slow pleasantry killed the whole voice line. They are two
+    # different failures and are now treated as two — see
+    # warmup_or_fresh in brain.py.
     log("[backtalk] connecting the brain...")
     try:
         await asyncio.wait_for(brain.start(), 120)
-
-        async def _warmup():
-            if brain.resumed:
-                # Reattached to the last conversation: the warmup turn
-                # is spoken, so the person hears where they left off
-                # and can choose to continue or start over.
-                #
-                # Wait for the voice first. The brain is usually warm
-                # well before the TTS pipeline is, and a recap spoken
-                # into a cold mouth is a recap nobody hears.
-                await asyncio.to_thread(mouth_mod.wait_warm, 180)
-                await speak_reply(brain, mouth, RESUME_RECAP)
-                return
-            async for _ in brain.ask_stream(
-                    "Warmup ping - reply with the single word: ready"):
-                pass
-        await asyncio.wait_for(_warmup(), 180)
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
@@ -770,7 +754,28 @@ async def amain():
                   "or the plan is out of usage.")
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
-    log("[backtalk] brain warm")
+
+    async def _warmup():
+        if brain.resumed:
+            # Reattached to the last conversation: the warmup turn
+            # is spoken, so the person hears where they left off
+            # and can choose to continue or start over.
+            #
+            # Wait for the voice first. The brain is usually warm
+            # well before the TTS pipeline is, and a recap spoken
+            # into a cold mouth is a recap nobody hears.
+            await asyncio.to_thread(mouth_mod.wait_warm, 180)
+            await speak_reply(brain, mouth, RESUME_RECAP)
+            return
+        async for _ in brain.ask_stream(
+                "Warmup ping - reply with the single word: ready"):
+            pass
+
+    # THE WARMUP is NOT fatal. It is a pleasantry on top of a live
+    # connection, and it must never be able to take the mic, the inbox
+    # and the GUI's data feed down with it.
+    if await warmup_or_fresh(brain, mouth, _warmup, timeout=180):
+        log("[backtalk] brain warm")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     # a configured effort level applies at launch (saved by the spoken
