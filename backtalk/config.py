@@ -34,6 +34,11 @@ REPO = Path(__file__).resolve().parent.parent
 # greeting) without a second copy of the code. A launcher exports it; nothing
 # else changes.
 CONFIG_PATH = Path(os.environ.get("BACKTALK_CONFIG") or (REPO / "backtalk.json"))
+# One shared config in git; one small file per machine beside it. Holds
+# ONLY what differs between machines (a folder that exists on one and not
+# the other). Merged OVER the shared config, never substituted for it, so
+# a machine with no overlay still gets a complete config. Git-ignored.
+LOCAL_CONFIG_PATH = CONFIG_PATH.with_suffix(".local.json")
 
 DEFAULTS = {
     # The folder whose CLAUDE.md defines WHO your agent is. The voice
@@ -283,18 +288,19 @@ def _expand(p: str) -> str:
 
 def load() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))          # deep copy
-    try:
-        user = json.loads(CONFIG_PATH.read_text())
-        for k, v in user.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
-    except FileNotFoundError:
-        pass
-    except ValueError as e:
-        print(f"[config] backtalk.json is not valid JSON ({e}) — "
-              f"using defaults", flush=True)
+    for path in (CONFIG_PATH, LOCAL_CONFIG_PATH):
+        try:
+            user = json.loads(path.read_text())
+            for k, v in user.items():
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+        except FileNotFoundError:
+            pass                        # no overlay is the normal case
+        except ValueError as e:
+            print(f"[config] {path.name} is not valid JSON ({e}) — "
+                  f"ignoring it", flush=True)
     cfg["agent_dir"] = _expand(cfg["agent_dir"])
     cfg["extra_dirs"] = [_expand(d) for d in cfg.get("extra_dirs", [])]
     cfg["signals_dir"] = _expand(cfg.get("signals_dir", "")) or str(REPO)

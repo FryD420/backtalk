@@ -29,3 +29,5 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+# Per-machine paths. Never shared --- that is the entire point.
+backtalk.local.json
