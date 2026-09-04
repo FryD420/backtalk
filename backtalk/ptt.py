@@ -74,6 +74,36 @@ def resolve_key(name: str):
         return keyboard.Key.home
 
 
+def _vk(key):
+    """The virtual-key code behind a pynput key, or None. Key enum members
+    wrap a KeyCode in .value; bare KeyCodes carry .vk themselves; single
+    characters from resolve_key have no vk at all."""
+    return getattr(getattr(key, "value", key), "vk", None)
+
+
+def same_key(a, b) -> bool:
+    """Is this the talk key? Plain equality first, then the virtual-key code.
+
+    pynput can hand the SAME physical key back under two names. On Windows
+    the right Alt key arrives as Key.alt_gr, because alt_r and alt_gr share
+    one virtual-key code (VK_RMENU) and the listener's lookup table keeps
+    whichever enum member was defined last. They are distinct members, so
+    a strict comparison against resolve_key("right_alt")'s Key.alt_r fails
+    on every press -- a healthy voice line that ignores its own button, with
+    nothing in the log to search for (found on a laptop, 2026-09-04, and
+    confirmed on a second Windows machine the same day).
+
+    The vk is the OS's own identity for a key, so two objects sharing one
+    ARE the same key; comparing on it fixes the whole class, where a
+    hand-kept list of which names alias which would rot. Keys with no vk
+    (single characters) keep plain equality.
+    """
+    if a == b:
+        return True
+    va = _vk(a)
+    return va is not None and va == _vk(b)
+
+
 class PTTListener:
     # How long a release must stand unchallenged before it is believed.
     # Comfortably longer than any keyboard's auto-repeat period (measured
@@ -92,7 +122,7 @@ class PTTListener:
         self._listener.start()
 
     def _on_press(self, k):
-        if k != self._key:
+        if not same_key(k, self._key):
             return
         # A press cancels any pending release: that release was auto-repeat,
         # not a human letting go.
@@ -102,7 +132,7 @@ class PTTListener:
             self._press_evt.set()
 
     def _on_release(self, k):
-        if k == self._key:
+        if same_key(k, self._key):
             # PROVISIONAL. Believed only if no press follows; see _settle().
             self._release_t = time.monotonic()
 
