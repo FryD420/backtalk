@@ -59,7 +59,7 @@ DEFAULTS = {
     # above). Full id ON PURPOSE, same reasoning as "model". The switch
     # lasts one session and is always spoken; this default never moves
     # by itself.
-    "deep_model": "claude-opus-5",
+    "deep_model": "claude-fable-5-1",
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
