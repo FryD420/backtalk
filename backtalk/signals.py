@@ -71,6 +71,16 @@ _BH_WAVE = os.path.join(_BH, "wave.json") if _BH else ""
 
 _THINKING_SOUND = CFG.get("thinking_sound") or ""
 
+# 0-100. Clamped, because a typo here used to mean a player flag that
+# either did nothing or blew the speakers out. 0 means silent, and
+# static_start() short-circuits on it rather than spawning a muted
+# process every single turn.
+try:
+    _THINKING_VOLUME = int(CFG.get("thinking_volume", 35))
+except (TypeError, ValueError):
+    _THINKING_VOLUME = 35
+_THINKING_VOLUME = max(0, min(100, _THINKING_VOLUME))
+
 _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
 _static_proc: subprocess.Popen | None = None
@@ -186,14 +196,17 @@ def set_rate_limit(window: str, utilization, resets_at):
 
 
 def _player_cmd(path: str) -> list[str] | None:
+    # afplay takes a 0-1 float, ffplay a 0-100 int. aplay and paplay take
+    # no volume flag at all, so on those two the setting only works as an
+    # on/off switch (static_start() handles the 0 case for everyone).
     if sys.platform == "darwin":
-        return ["afplay", "-v", "0.35", path]
+        return ["afplay", "-v", f"{_THINKING_VOLUME / 100:.2f}", path]
     for cand in ("ffplay", "aplay", "paplay"):
         from shutil import which
         if which(cand):
             if cand == "ffplay":
                 return ["ffplay", "-nodisp", "-autoexit", "-loglevel",
-                        "quiet", "-volume", "35", path]
+                        "quiet", "-volume", str(_THINKING_VOLUME), path]
             return [cand, path]
     return None
 
@@ -201,7 +214,9 @@ def _player_cmd(path: str) -> list[str] | None:
 def static_start():
     """Optional thinking sound — plays while the brain works."""
     global _static_proc
-    if not _THINKING_SOUND or not os.path.exists(_THINKING_SOUND):
+    if not _THINKING_SOUND or not _THINKING_VOLUME:
+        return
+    if not os.path.exists(_THINKING_SOUND):
         return
     static_stop()
     cmd = _player_cmd(_THINKING_SOUND)

@@ -209,6 +209,10 @@ DEFAULTS = {
     # a dead line. The bundled one ships in assets/; a relative path
     # resolves against this repo. Set "" to think in silence.
     "thinking_sound": "assets/thinking.wav",
+    # How loud that sound plays, 0-100. 0 is silent, which is also how
+    # you turn it off without clearing the path above. Read once at
+    # startup, so a change needs a restart of the voice line.
+    "thinking_volume": 35,
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
     # Spoken instead of "greeting" when mic_mode is "open", where telling
