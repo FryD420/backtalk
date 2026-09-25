@@ -24,10 +24,52 @@ only printed to a terminal window nobody saved. Every load-bearing line
 through log() so the next gremlin comes with receipts.
 """
 import datetime
+import os
 import sys
 from pathlib import Path
 
-LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "backtalk.log"
+_LOGS = Path(__file__).resolve().parent.parent / "logs"
+
+
+def _resolve_log_path() -> Path:
+    """Pick the log file, keeping the TEST suite out of the real one.
+
+    The production log is a diagnostic record, not a scratch file — this
+    module exists because a bug once had to be reconstructed from it. But
+    the test suite imports the same modules the voice line does, so running
+    it appended fake gate cases and lines like "no brain at all" straight
+    into logs/backtalk.log. The receipts then read as though real launches
+    had failed, which is worse than having no log: it actively misleads
+    whoever is chasing the next gremlin.
+
+    Two ways out, in priority order:
+
+    1. BACKTALK_LOG, an explicit path override. For anything that wants its
+       own log — a harness, a one-off repro, a second instance.
+    2. argv[0] sitting in tests/ — every test here is run as
+       `python tests/test_x.py`, so this catches a directly-run test with no
+       edits to the test files themselves. That matters: their import
+       preludes all differ, so a per-file fix would have been eleven
+       inconsistent edits, and the twelfth test written would forget.
+
+    Deliberately a heuristic, and deliberately a safe one: if the sniff ever
+    misses, the only cost is a test writing the production log — exactly
+    today's behaviour, never a lost or misdirected production line.
+    """
+    override = os.environ.get("BACKTALK_LOG")
+    if override:
+        return Path(override)
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0:
+        try:
+            if Path(argv0).resolve().parent.name == "tests":
+                return _LOGS / "backtalk-test.log"
+        except OSError:
+            pass  # unresolvable argv0 is not a reason to lose logging
+    return _LOGS / "backtalk.log"
+
+
+LOG_PATH = _resolve_log_path()
 
 
 def _init_console():
