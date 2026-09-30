@@ -53,7 +53,7 @@ DEFAULTS = {
     # can silently land on an older model. The fast tier is most of the
     # speed difference people ask about; a deep-work model makes every
     # reply noticeably slower and burns usage doing it.
-    "model": "claude-sonnet-5",
+    "model": "claude-sonnet-5-5",
     # The deep-work model for the voice console's "switch to the deep
     # model" command ("back to the fast model" returns to "model"
     # above). Full id ON PURPOSE, same reasoning as "model". The switch
