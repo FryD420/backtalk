@@ -4,5 +4,18 @@
   "ptt_key": "home",
   "voice": "bm_lewis",
   "stt_model": "small.en",
-  "inbox_port": 0
+  "inbox_port": 0,
+  "background_speech": "off",
+  "background_lines": {
+    "interrupt": "Hold on, we're being interrupted. {what} just {status}.",
+    "idle": "Heads up. {what} just {status}.",
+    "another": "And another one.",
+    "resume": "Right, back to what I was saying.",
+    "while_you_talked": "Also, while you were talking: {what} {status}.",
+    "rest_on_screen": "The rest is on the screen."
+  },
+  "background_max_sentences": 4,
+  "background_backlog": 3,
+  "background_hold_max_s": 600,
+  "fg_hold_s": 20
 }

@@ -30,6 +30,11 @@ is the whole integration surface:
                       deleted when the turn ends
   .voice_rate_limits  JSON {window: {utilization, resets_at}} — only
                       written when show_usage is on
+  .voice_unspoken     JSON lines {ts, origin, reason, what, partial,
+                      text} — agent text that was NOT spoken (cut off,
+                      capped, background news while it was switched
+                      off, left at shutdown). Appended; trimmed to the
+                      newest 200 lines once it passes 256 KB
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work. The heartbeat and activity files are how a face
@@ -64,6 +69,9 @@ _ACTIVITY_FILE = os.path.join(_DIR, ".voice_activity")
 _DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
 _REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_UNSPOKEN_FILE = os.path.join(_DIR, ".voice_unspoken")
+_UNSPOKEN_MAX_BYTES = 256 * 1024
+_UNSPOKEN_KEEP_LINES = 200
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -162,6 +170,48 @@ def reply_done():
         with open(_REPLY_DONE_FILE, "w") as f:
             f.write(json.dumps({"ts": time.time()}))
     except OSError:
+        pass
+
+
+def unspoken(origin: str, reason: str, text: str, what=None,
+             partial: bool = False):
+    """Record agent text that reached the voice line but was not spoken.
+
+    Nothing the agent says may vanish into the log alone: background
+    news that arrived while speech was off, the rest of a reply the
+    person cut off, sentences over the background cap, whatever was
+    still queued at shutdown. Each lands here as one JSON line so a
+    face can show it:
+
+      {ts, origin, reason, what, partial, text}
+
+    origin is "fg" (an answer to something asked) or "bg" (a turn
+    nobody asked for). reason is one of: interrupted, silenced, capped,
+    backlog, too_old, no_text, rebuild, brain_lost, shutdown,
+    speech_off. partial marks the chunk that was playing when it was
+    cut. what names the background job, when known.
+
+    Appended, and trimmed to the newest 200 lines once the file passes
+    256 KB. Like every bus write, it never raises. Each record is also
+    logged."""
+    text = " ".join(str(text or "").split())
+    try:
+        from backtalk.vlog import log
+        log(f"[floor] unspoken ({reason}): {text[:300]}"
+            + (f"  [{what}]" if what and reason == "no_text" else ""))
+    except Exception:
+        pass
+    try:
+        rec = {"ts": time.time(), "origin": origin, "reason": reason,
+               "what": what, "partial": bool(partial), "text": text}
+        with open(_UNSPOKEN_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        if os.path.getsize(_UNSPOKEN_FILE) > _UNSPOKEN_MAX_BYTES:
+            with open(_UNSPOKEN_FILE, encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(_UNSPOKEN_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_UNSPOKEN_KEEP_LINES:])
+    except Exception:
         pass
 
 

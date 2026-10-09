@@ -224,6 +224,43 @@ DEFAULTS = {
     # CLAUDE.md covers the character. Use this for a note that belongs to
     # neither, e.g. a rule that only applies when it is speaking.
     "discipline_append": "",
+    # BACKGROUND NEWS: turns the agent takes that nobody asked for (a
+    # background agent or shell job finished and woke it up). One reader
+    # owns the message pipe either way, so such a turn can never be
+    # mistaken for the answer to your next question. This decides what
+    # happens to its words:
+    #   "off"        never spoken. Written to .voice_unspoken and the log.
+    #   "idle"       spoken when nothing else is playing; never cuts in.
+    #   "interrupt"  also cuts into a reply at the end of the sentence
+    #                being spoken, gives the news, then picks the reply
+    #                back up where it stopped.
+    # Nothing is ever spoken while the key is held, while the open mic
+    # is catching an utterance, or while a permission question waits.
+    "background_speech": "off",
+    # The lines that frame background news. {what} names the job ("the
+    # build-the-APK agent", "Something" when unknown), {status} is
+    # "finished", "failed" or "was stopped". Plain on purpose: make them
+    # sound like your agent in your own backtalk.json.
+    "background_lines": {
+        "interrupt": "Hold on, we're being interrupted. {what} just {status}.",
+        "idle": "Heads up. {what} just {status}.",
+        "another": "And another one.",
+        "resume": "Right, back to what I was saying.",
+        "while_you_talked": "Also, while you were talking: {what} {status}.",
+        "rest_on_screen": "The rest is on the screen.",
+    },
+    # At most this many sentences of one background turn are spoken; the
+    # rest goes to .voice_unspoken ("capped").
+    "background_max_sentences": 4,
+    # At most this many background turns wait to be spoken; older ones
+    # go to .voice_unspoken ("backlog").
+    "background_backlog": 3,
+    # News held longer than this (seconds) is written down, not spoken.
+    "background_hold_max_s": 600,
+    # Only used if the CLI never echoes prompts back (it does on current
+    # versions): a question asked during a background turn waits at most
+    # this long for that turn to end before it is sent anyway.
+    "fg_hold_s": 20,
 }
 
 # The spoken-delivery discipline — the MEDIUM half of what used to be a
@@ -260,7 +297,10 @@ DISCIPLINE = (
     "You cannot flip "
     "these live yourself, so when asked, give the person the exact "
     "phrase to SAY. Editing backtalk.json only changes the default "
-    "for the NEXT launch."
+    "for the NEXT launch. "
+    "When a background task result reaches you, open with a "
+    "one-sentence gist of what came in, keep it to two or three "
+    "sentences, and don't narrate routine follow-up steps out loud."
 )
 
 

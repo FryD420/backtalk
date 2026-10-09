@@ -56,7 +56,6 @@ import asyncio
 import json
 import os
 import queue
-import re
 import socket
 import sys
 import threading
@@ -69,6 +68,9 @@ from backtalk.brain import (WarmBrain, clear_declined, load_declined,
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
+# The chunking helpers moved to floor.py (one shared chunker for answers
+# and background news); imported back so existing references keep working.
+from backtalk.floor import _DIRECTION_TAG, Chunker, Floor, _defence  # noqa: F401
 from backtalk import mouth as mouth_mod
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
@@ -142,7 +144,8 @@ def _norm_speech(text):
 def _deny_pending(reason=_INTERRUPT_ANSWER):
     """Resolve a pending spoken ask as a deny. Called whenever the turn
     that posed it is being interrupted, so the ask can never outlive its
-    turn and hijack a later utterance (or stall the pipe drain)."""
+    turn and hijack a later utterance (or stall reset_turn waiting on
+    its turn)."""
     f = _PERM["fut"]
     if f is not None and not f.done():
         f.set_result(reason)
@@ -216,9 +219,14 @@ def _full_detail(tool, tool_input, ctx):
     return f"use {name}" + (f", {desc[:70]}" if desc else "")
 
 
-def make_permission_gate(mouth):
+def make_permission_gate(floor):
+    """The spoken gate. Its lines go through the floor (floor.prompt), so
+    the question takes the speaker at the next chunk boundary, waits
+    while the key is held, and says so when a BACKGROUND job is the one
+    asking."""
     from claude_agent_sdk import (PermissionResultAllow,
                                   PermissionResultDeny)
+    mouth = floor.mouth
 
     async def gate(tool, tool_input, ctx):
         if _AUTOAPPROVE["on"]:
@@ -239,7 +247,7 @@ def make_permission_gate(mouth):
             _PERM["hinted"] = True
             ask += (" And any time you're done with these checks, say "
                     "stop asking for permission.")
-        mouth.say(ask)
+        floor.prompt(ask)
         answer = None
         try:
             deadline = loop.time() + PERM_TIMEOUT_S
@@ -255,7 +263,8 @@ def make_permission_gate(mouth):
                     except asyncio.TimeoutError:
                         if loop.time() >= deadline:
                             fut.cancel()
-                            mouth.say("No answer, so I didn't do it.")
+                            floor.prompt("No answer, so I didn't do it.",
+                                         from_bg=False)
                             log("[perm]   timed out, denied")
                             return PermissionResultDeny(
                                 behavior="deny",
@@ -272,8 +281,8 @@ def make_permission_gate(mouth):
                     # fresh clock: asking for details is engagement,
                     # not silence
                     log("[perm]   details requested")
-                    mouth.say(f"The details: I want to {detail}. "
-                              "Yes or no?")
+                    floor.prompt(f"The details: I want to {detail}. "
+                                 "Yes or no?", from_bg=False)
                     deadline = loop.time() + PERM_TIMEOUT_S
                     continue
                 answer = got
@@ -426,10 +435,8 @@ _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
 
 
-# <<anything>> is a stage direction: lifted out, never spoken, published on
-# the bus when the audio carrying it starts. Bounded so a runaway model cannot
-# swallow a paragraph into one "tag".
-_DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
+# _DIRECTION_TAG (<<stage directions>>) lives in floor.py now, with the
+# chunker that lifts them out; imported at the top.
 
 # NOTE, merge 2026-09-02: upstream also defines _clean_typed/_join_paste
 # right here. They are byte-for-byte the functions this branch already
@@ -593,76 +600,31 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-def _defence(raw: str, in_fence: bool) -> tuple[str, bool]:
-    """Split out fenced-code content (Joe, 2026-08-24): everything between
-    ``` markers is for the DASHBOARD, not the mouth — pasted paths, markup,
-    whole listing bodies. Returns (speakable text, new fence state). State
-    persists across chunks because a fence usually opens in one sentence
-    chunk and closes many chunks later."""
-    parts = raw.split("```")
-    spoken, state = [], in_fence
-    for i, part in enumerate(parts):
-        if not state:
-            spoken.append(part)
-        if i < len(parts) - 1:
-            state = not state
-    return " ".join(spoken), state
-
-
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, floor: Floor, text: str):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). The chunks go to the floor, which
+    feeds the mouth just in time so background news can be slipped in
+    at a chunk boundary (floor.py). Fenced code and <<directions>> are
+    handled by the shared Chunker there."""
     t0 = time.time()
-    first = True
-    in_fence = False
-    batch: list[str] = []
-    pending: list[str] = []          # directions waiting for their chunk
+    token = floor.fg_begin()
 
-    def emit(raw: str):
-        nonlocal first, batch, in_fence, pending
-        # Fenced blocks are dashboard-only - never spoken (they still
-        # reach the transcript untouched; this only mutes the mouth).
-        # OURS, kept: upstream has no equivalent.
-        raw, in_fence = _defence(raw, in_fence)
-        # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
-        # lifted out here, never spoken, and published on the signal bus when
-        # this chunk's audio starts (signals.direction). backtalk has no
-        # opinion on what a direction means; something watching the bus does.
-        #
-        # THEIRS, taken over ours: this branch used to strip only the angle
-        # brackets, which left the tag BODY in the sentence for the TTS to
-        # read aloud. Lifting the whole tag out is strictly better, and it
-        # publishes the direction instead of throwing it away.
-        found = _DIRECTION_TAG.findall(raw)
-        if found:
-            pending += [d.strip() for d in found if d.strip()]
-        raw = _DIRECTION_TAG.sub(" ", raw)
-        # TTS hygiene: backticks and markdown fences are never speakable.
-        s = " ".join(raw.replace("`", "").split()).strip()
-        if not s:
-            return
+    def said(s, first, pending):
         if first:
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
-            pending = []
-            first = False
         else:
-            log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
-            batch.append(s)
-            if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch), pending)
-                pending = []
-                batch = []
+            log(f"[{NAME}] {s}"
+                + (f"  <directions: {pending}>" if pending else ""))
 
+    chunker = Chunker(lambda chunk, dirs: floor.fg_chunk(chunk, dirs, token),
+                      single=floor.single_sentence, on_sentence=said)
     try:
         async for sentence in brain.ask_stream(text):
-            emit(sentence)
-        if batch:
-            mouth.say_chunk(" ".join(batch), pending)
-            pending = []
-        if first:
+            chunker.feed(sentence)
+        chunker.flush()
+        if chunker.empty:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
             signals.static_stop()
@@ -673,6 +635,9 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+    finally:
+        # stale-token safe: after a silence() this is a no-op
+        floor.fg_done(token)
 
 
 async def amain():
@@ -711,9 +676,26 @@ async def amain():
     # Mouth should not drag Kokoro into a unit test.
     mouth_mod.start_warming()
     ears = Ears()
+    # THE FLOOR: one owner of the speaker during turns (floor.py). The
+    # person has the floor while the key is held, while the button is
+    # recording or transcribing (_MIC["btn"] clears only after
+    # record_held returns), or while the open mic is mid-utterance; a
+    # pending permission question blocks everything but its own lines.
+    # The PTT listener is built inside the main loop below, hence the
+    # holder.
+    ptt_ref: list = [None]
+    floor = Floor(
+        mouth,
+        user_active=lambda: bool(
+            (ptt_ref[0] is not None and ptt_ref[0].is_held())
+            or _MIC["btn"] or ears.in_utterance),
+        perm_pending=lambda: (_PERM["fut"] is not None
+                              and not _PERM["fut"].done()))
     brain = WarmBrain(model=model,
-                      can_use_tool=make_permission_gate(mouth),
+                      can_use_tool=make_permission_gate(floor),
                       resume_id=resume_id)
+    floor.brain = brain
+    floor_task: asyncio.Task | None = None
     # The bus heartbeat (.voice_heartbeat, every ~2 s) starts NOW, on
     # this loop, so the face reads LINK LIVE from the first second of
     # boot and LOST the moment this process dies or the loop wedges.
@@ -781,6 +763,8 @@ async def amain():
                   "or the plan is out of usage.")
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
+    log(f"[backtalk] background speech: {floor.mode}")
+    floor_task = asyncio.create_task(floor.run(), name="backtalk-floor")
 
     async def _warmup():
         if brain.resumed:
@@ -792,7 +776,7 @@ async def amain():
             # well before the TTS pipeline is, and a recap spoken
             # into a cold mouth is a recap nobody hears.
             await asyncio.to_thread(mouth_mod.wait_warm, 180)
-            await speak_reply(brain, mouth, RESUME_RECAP)
+            await speak_reply(brain, floor, RESUME_RECAP)
             return
         async for _ in brain.ask_stream(
                 "Warmup ping - reply with the single word: ready"):
@@ -822,9 +806,9 @@ async def amain():
 
     async def run_console(verb):
         """One voice-console verb. The current reply was already
-        cancelled and awaited by handle(); the pipe gets drained here
-        before the command goes out. A verb that blows up must never
-        take the whole voice session down with it."""
+        cancelled and awaited by handle(); reset_turn makes sure no turn
+        of ours is running before the command goes out. A verb that
+        blows up must never take the whole voice session down with it."""
         try:
             await _run_console_inner(verb)
         except Exception as e:
@@ -880,7 +864,7 @@ async def amain():
                 else:
                     clear_declined()
                     log(f"[console] reattached to {sid[:8]} on request")
-                    await speak_reply(brain, mouth, RESUME_RECAP)
+                    await speak_reply(brain, floor, RESUME_RECAP)
         elif verb == "compact":
             mouth.say("Compacting. One moment.")
             resp = await brain.command("/compact")
@@ -1038,7 +1022,9 @@ async def amain():
         if any(q in text.lower() for q in QUIT_PHRASES):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
-            mouth.shut_up()
+            # held and queued text goes to .voice_unspoken ("shutdown")
+            # before the sign-off line, and no news may follow it
+            floor.shutdown()
             mouth.say(CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
@@ -1046,7 +1032,12 @@ async def amain():
             log("[turn] interrupted mid-reply by new input")
             _deny_pending()          # an ask never outlives its turn
             speak_task.cancel()
-            mouth.shut_up()
+            floor.silence("interrupted")
+        elif floor.active():
+            # background news playing: a typed or inbox line interrupts
+            # it like any reply (its CLI turn is left running)
+            log("[turn] news interrupted by new input")
+            floor.silence("interrupted")
         if speak_task:
             # Let the cancellation fully land (its brain.interrupt()
             # included) BEFORE anything else touches the brain —
@@ -1067,13 +1058,14 @@ async def amain():
         signals.set_state("thinking")
         signals.static_start()
         signals.turn_begin()     # .voice_activity: the turn clock starts
-        # Clean the pipe: drain the interrupted turn's leftovers so the
-        # new question can't pair with a stale ResultMessage. A gate
-        # that fired in the meantime resolves first, or the drain would
-        # wait on a ResultMessage the CLI is withholding for an answer.
+        # Make sure no turn of OURS is still running (the pipe reader
+        # pairs answers to questions, so there is nothing to drain). A
+        # gate that fired in the meantime resolves first, or the wait
+        # would be on a ResultMessage the CLI is withholding for an
+        # answer. A background turn is left running.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(speak_reply(brain, floor, text))
         return True
 
     try:
@@ -1085,6 +1077,7 @@ async def amain():
         # callable closes the in-flight open mic promptly, and any
         # capture born under an old gen is discarded unprocessed.
         ptt = PTTListener(CFG["ptt_key"])
+        ptt_ref[0] = ptt                 # the floor watches the key too
         press_fut: asyncio.Future | None = None
         mic_fut: asyncio.Future | None = None
         mic_gen_seen = _MIC["gen"]
@@ -1156,7 +1149,12 @@ async def amain():
                     speak_task.cancel()          # the button = interrupt
                 # During a permission ask the TURN stays alive; the
                 # press only silences playback and records the answer.
-                mouth.shut_up()
+                # Otherwise the press silences everything, news included
+                # (what was cut goes to .voice_unspoken).
+                if perm_wait:
+                    floor.silence_playback()
+                else:
+                    floor.silence("interrupted")
                 signals.static_stop()            # button kills the static too
                 signals.set_state("listening")
                 mouth.ducker.speech_start()      # duck NOW, while you talk
@@ -1195,6 +1193,9 @@ async def amain():
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
         if speak_task and not speak_task.done():
             speak_task.cancel()
+        floor.shutdown()  # held/queued text -> .voice_unspoken ("shutdown")
+        if floor_task is not None:
+            floor_task.cancel()
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")

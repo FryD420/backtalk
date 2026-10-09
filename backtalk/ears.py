@@ -345,6 +345,11 @@ class Ears:
     def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
         self.vad = webrtcvad.Vad(aggressiveness)
         self.silence_frames = silence_ms // FRAME_MS
+        # True while the open mic is catching an utterance (from the
+        # moment speech opens one until listen_once returns). The floor
+        # (floor.py) reads it: background news never talks over someone
+        # who is mid-sentence. False on every return path.
+        self.in_utterance = False
 
     def listen_once(self, gate=None, timeout_s: float | None = None,
                     abort=None) -> str | None:
@@ -353,6 +358,12 @@ class Ears:
         frame; returning True closes the mic and returns None, which
         is how a live switch back to push-to-talk shuts the open mic
         down promptly instead of after one more utterance."""
+        try:
+            return self._listen_once(gate, timeout_s, abort)
+        finally:
+            self.in_utterance = False
+
+    def _listen_once(self, gate, timeout_s, abort):
         frames: list[np.ndarray] = []
         ring: list[np.ndarray] = []   # pre-roll so the first syllable survives
         speech_run = 0
@@ -382,6 +393,7 @@ class Ears:
                     speech_run = speech_run + 1 if is_speech else 0
                     if speech_run >= OPEN_FRAMES:
                         in_utterance = True
+                        self.in_utterance = True
                         frames = ring[:]
                         silence_run = 0
                 else:
@@ -397,6 +409,7 @@ class Ears:
                             # <240ms of actual speech: a noise blip, not
                             # a sentence — keep listening
                             in_utterance = False
+                            self.in_utterance = False
                             frames, ring = [], []
                             speech_run = speech_total = 0
                             continue

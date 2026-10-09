@@ -27,7 +27,8 @@ Written for humans AND for AI assistants. If you're an AI helping someone debug 
 - **It asked permission, then said "no answer, so I didn't do it"**: the spoken ask waits about 75 seconds, then treats silence as no. Hold the key and answer with an exact "yes" (or "go ahead", "approved") to approve, "details" to hear the exact command it wants to run, or anything else to deny; a denial's words are passed back to the agent as the reason, so spoken redirections work. Done with the checks entirely? "Stop asking for permission" and "turn off the permission prompts" both work, with a confirm.
 - **A voice command didn't trigger**: console phrases match exactly, spoken alone: "clear the session", "compact the session", "switch to the deep model", "back to the fast model", "set effort to low" (or medium, high, max), "usage report", "go hands free" and "push to talk mode" (the microphone), "stop asking for permission" and "start asking again" (approvals), "bring back the last conversation" (recover a session the launch dropped for being too old). Extra words around them make a normal sentence for the agent instead. That guard is deliberate.
 - **"Hands-free" vs auto-approve, because the words matter**: hands-free is the MICROPHONE (always listening, no button; "go hands free" / "push to talk mode"). Auto-approve is PERMISSIONS (act without asking; "stop asking for permission" / "start asking again"). They are separate settings and switch separately.
-- **It answers my previous question instead of the one I just asked**: this is the interrupt-desync bug this codebase specifically armors against (`brain.reset_turn`); if you EVER see it, something has changed in the SDK. Grab `logs/backtalk.log` and file an issue; the log will show whether the stale-turn drain ran.
+- **It answers my previous question instead of the one I just asked** (or answers with something from a job that finished in the background): this is the pairing bug this codebase specifically armors against. One reader (`brain._read_pipe`) owns the message stream and ties every answer to its question by the CLI's echo of the prompt, so if you EVER see it, something has changed in the SDK or the CLI. Grab `logs/backtalk.log` and file an issue; the `[reader]` lines show how each turn was attributed (`fg` = an answer to you, `bg` = nobody asked, `cmd` = a voice-console command), and a line saying an echo "matched no question" or a "cross-check" is the smoking gun.
+- **A background job finished and it never said so** (or it said "Heads up" when you didn't want it to): that is `"background_speech"` in backtalk.json. `"off"` (the default) never speaks background news and writes it to `.voice_unspoken` in `signals_dir` instead, and the log carries it as `[floor] unspoken (speech_off): ...`. `"idle"` speaks it only when nothing else is playing. `"interrupt"` also cuts into a reply at the end of the sentence being spoken, gives the news, and picks the reply back up. It never talks while the key is held, while the open mic is catching you, or while a permission question waits; anything it does not say (cut off, capped at `background_max_sentences`, held too long) goes to `.voice_unspoken` with the reason.
 
 ## Windows notes
 
@@ -56,7 +57,10 @@ Hands-free listening (the setup question, `"mic_mode": "open"`, the spoken "go h
 hold key -> ears.record_held (sounddevice, 16kHz int16)
          -> ears.transcribe (faster-whisper, in-process, local)
          -> brain.ask_stream (warm Claude Agent SDK session,
-                              cwd = agent_dir, streams sentences)
+                              cwd = agent_dir; ONE reader, _read_pipe,
+                              attributes every turn fg/cmd/bg)
+         -> floor (floor.py: feeds the mouth just in time; background
+                   news in between, per background_speech)
          -> mouth.say_chunk (kokoro in-process -> one long-lived
                              OutputStream; ElevenLabs optional)
 signals.py mirrors state to .voice_* files (+ optional barehands state/)
@@ -70,22 +74,24 @@ permission_mode "ask": gated tools pause the turn and route to a spoken
                        and the talk key works in both
 ```
 
-Three land mines with warning signs on them; do not "simplify" these away:
+The land mines with warning signs on them; do not "simplify" these away:
 
 1. **The key-repeat filter in `ptt.py`.** The OS fires on_press continuously while a key is held; without the held-state flag, every repeat cancels the reply before it can speak.
 2. **The one long-lived output stream in `mouth.py`.** A fresh stream per sentence causes onset blips or dead air on USB interfaces, Bluetooth, and streaming mixers. Interrupts pad silence into the stream; they never close it.
-3. **`brain.reset_turn` in `brain.py`.** The SDK has one shared message stream with no query/response pairing; an interrupted turn leaves its leftovers buffered, and without the drain every later answer is off by one question.
+3. **The single pipe reader, `brain._read_pipe`.** The SDK has one shared message stream with no query/response pairing, and the agent also takes turns nobody asked for (a background agent or job finishes and wakes it). The reader drains every frame the moment it lands and attributes each turn by the CLI's echo of the prompt (`replay-user-messages`): an answer to our question, a slash command, or background. Read the stream only while our own turn runs and two things break: a background turn fills the SDK's 100-message buffer, whose blocking send then freezes the CLI mid-turn (permission prompts from that turn included), and its leftovers pair with the next question, so every later answer is off by one. `reset_turn` no longer drains anything; it interrupts an open turn of ours and waits for it to close, or rebuilds the session if it never does.
 4. **The pending-permission routing in `main.py`.** While a spoken permission ask is waiting, the next utterance is the ANSWER: it must never be treated as an interrupt or a new turn, or the paused turn gets cancelled out from under the SDK. The same goes for the live auto-approve switch: the CLI refuses a live flip INTO bypassPermissions (it needs the danger flag at launch), which is why auto-approve is a gate flag instead of an SDK mode change.
 5. **The mic generation counter (`_MIC["gen"]`).** A live switch between push-to-talk and hands-free listening bumps it; the open mic's abort callable watches it, and any capture born under an old generation is discarded. Without it, a switch back to push-to-talk leaves an open mic capturing one final utterance that then fires as a ghost turn.
+6. **`Mouth.yield_floor` never touches `_gen`, and only `_read_pipe` reads the pipe.** `yield_floor` is how the floor makes room for news or a permission question at a chunk boundary: it pulls back the chunks that have not started and flags them `dropped`. Bumping the barge-in generation instead (what `shut_up` does) would cut the playing chunk mid-word. And any second reader of `receive_messages()`/`receive_response()` brings back both failures in point 3; `tests/test_pipe_reader.py` fails the build if one appears anywhere but `_read_pipe`.
 
 ## Verify a working install
 
 1. `./run.sh` → greeting speaks.
 2. Hold the key, ask something, release → answer within ~2s.
 3. Interrupt mid-reply with the key → it stops within a syllable.
-4. Interrupt, then ask something NEW → the answer matches the NEW question (repeat 3×: that's the stream drain proving itself).
+4. Interrupt, then ask something NEW → the answer matches the NEW question (repeat 3×: that's the pipe reader's pairing proving itself).
 5. Ask something that needs a tool ("what's in my notes about X") → it speaks filler within a couple of seconds, then the answer.
 6. Type a message in the terminal → spoken reply, same conversation.
 7. Say "usage report" → it speaks turns and tokens (plus cost when the API reports one).
 8. In ask mode: request a small file write → the spoken permission check plays → "yes" proceeds, and a second attempt answered "no" stands down.
-9. Say "goodbye <name>" → sign-off plays, process exits, music restores.
+9. Background news: ask for a 20-second background job ("run sleep 20 then echo done in the background"), then ask something else → your answer is the answer to what you just asked, never the job's. When the job finishes: with `"background_speech": "off"` nothing is said and `.voice_unspoken` gains a `speech_off` line; with `"idle"` you hear "Heads up..." and the news; with `"interrupt"`, ask a long question just before it lands and you hear the reply stop at a sentence end, "Hold on...", the news, "Right, back to what I was saying", and the rest. Press the key during the news → silence at once, and the cut text is in `.voice_unspoken`. Either way the log shows `[reader]` lines and never "dropped N buffered messages".
+10. Say "goodbye <name>" → sign-off plays, process exits, music restores.

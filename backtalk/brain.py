@@ -27,15 +27,23 @@ The session's cwd is YOUR agent's folder (agent_dir in backtalk.json) —
 whatever CLAUDE.md lives there defines who is speaking. backtalk adds
 only the spoken-delivery discipline (config.DISCIPLINE): the medium,
 never the character.
+
+ONE READER OWNS THE PIPE (WarmBrain._read_pipe). The session also takes
+turns nobody asked for (a background agent or job finishes and wakes
+the model), so the message stream is read continuously, every turn is
+attributed (fg: an answer to our question, cmd: a slash command, bg:
+nobody asked) by the CLI's echo of each prompt, and ask_stream/command
+only consume what the reader routes to them. Background turns go to
+self.events for the floor (floor.py) to speak or write down.
 """
 import asyncio
+import itertools
 import os
 import re
 import time
 import warnings
+from collections import deque
 from datetime import datetime
-
-import anyio
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
@@ -214,6 +222,94 @@ async def warmup_or_fresh(brain, mouth, warmup, timeout: float = 180) -> bool:
     return False
 
 
+# Task statuses that mean a background task is over. Both vocabularies:
+# task_notification says "stopped", task_updated says the raw "killed".
+_TERMINAL = frozenset({"completed", "failed", "stopped", "killed"})
+
+
+def _norm(text: str) -> str:
+    return " ".join(str(text or "").split()).lower()
+
+
+def _prompt_text(content):
+    """The text of a user frame IF it looks like a prompt (a string, or
+    text blocks only). Tool results and anything else return None."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and all(
+            type(b).__name__ == "TextBlock" for b in content):
+        return " ".join(getattr(b, "text", "") or "" for b in content)
+    return None
+
+
+class _Ticket:
+    """One prompt we sent, waiting for the CLI to take it in. FIFO: the
+    echo of its own text (replay-user-messages) is what claims a turn."""
+    __slots__ = ("prompt", "norm", "cmdword", "origin", "blind", "turn",
+                 "ready", "done")
+
+    def __init__(self, prompt: str, origin: str, blind: bool):
+        self.prompt = prompt
+        self.norm = _norm(prompt)
+        # slash commands may come back in the CLI's own wrapper rather
+        # than verbatim, so a command matches on its command word too
+        self.cmdword = (self.norm.split()[0]
+                        if origin == "cmd" and self.norm.startswith("/")
+                        else None)
+        self.origin = origin            # "fg" | "cmd"
+        self.blind = blind              # sent before any echo was seen
+        self.turn: "Turn | None" = None
+        self.ready = asyncio.Event()    # set once turn is known (or never)
+        self.done = False               # the asker stopped listening
+
+
+class Turn:
+    """One CLI turn as the reader attributes it.
+
+    origin: "fg" (an answer to something we asked), "cmd" (a slash
+    command or warmup), "bg" (nobody asked). A CLI turn can be split in
+    two here: a question folded into a running background turn turns
+    the rest of it fg from the echo on, so the bg Turn closes ("folded")
+    and a fg one opens at that frame."""
+    _ids = itertools.count(1)
+
+    def __init__(self, origin: str, ticket: _Ticket | None = None):
+        self.id = next(Turn._ids)
+        self.origin = origin
+        self.ticket = ticket
+        self.sentences: asyncio.Queue = asyncio.Queue()   # fg: str, None
+        self.texts: list[str] = []          # complete AssistantMessage text
+        self.closed = asyncio.Event()
+        self.result = None
+        self.reason: str | None = None
+        self.saw_news = False               # news folded into this turn
+        self.info: dict | None = None       # bg: the task that woke it
+        self.buf = ""
+        self.count = 0
+        self.lost_text: list[str] = []      # fg text nobody was left to hear
+
+
+class BgEvent:
+    """What the reader tells the floor about turns nobody asked for."""
+    TURN_OPEN = "turn_open"
+    SENTENCE = "sentence"
+    TASK_DONE = "task_done"
+    TURN_CLOSE = "turn_close"
+    RESET = "reset"          # rebuild / brain lost / clear: held news is void
+    __slots__ = ("kind", "turn_id", "text", "info", "reason")
+
+    def __init__(self, kind, turn_id=None, text=None, info=None, reason=None):
+        self.kind = kind
+        self.turn_id = turn_id
+        self.text = text
+        self.info = info
+        self.reason = reason
+
+    def __repr__(self):
+        return (f"BgEvent({self.kind}, turn={self.turn_id}, "
+                f"text={self.text!r}, reason={self.reason})")
+
+
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
                  resume_id: str | None = None):
@@ -239,9 +335,42 @@ class WarmBrain:
         # (main.py speaks a where-were-we recap instead of the silent
         # warmup ping in that case).
         self.resumed = False
-        # True while a query's response hasn't been consumed through its
-        # ResultMessage — i.e. the shared message pipe may hold leftovers.
-        self._dirty = False
+        # THE SINGLE PIPE READER (see _read_pipe). It belongs to the
+        # client it was started for; stop() cancels it and waits before
+        # disconnecting, start() spawns the next one.
+        self._reader: asyncio.Task | None = None
+        self._open: Turn | None = None          # the turn frames go to
+        self._tickets: list[_Ticket] = []       # sent, not yet claimed
+        self._tasks: dict = {}                  # task id -> info
+        self._done: deque = deque(maxlen=10)    # finished, not yet claimed
+        self._side: set = set()                 # spawned side tasks
+        # Background news for the floor (floor.py). Unbounded on purpose:
+        # the reader must never wait on anyone, or the SDK's 100-message
+        # buffer fills and the CLI stalls (spec 2026-10-08, section 1).
+        self.events: asyncio.Queue = asyncio.Queue()
+        # The reader died (CLI crash, error frame). The next question
+        # rebuilds the session, the way reset_turn's rebuild does.
+        self.lost = False
+        # True once this connection has echoed a prompt back. Until then
+        # attribution falls back to turn order (and fg_hold_s).
+        self._echo_seen = False
+
+    # ---- what other modules may look at -------------------------------
+
+    @property
+    def open_origin(self) -> str | None:
+        """Origin of the turn currently streaming ("fg"/"cmd"/"bg"), or
+        None between turns. The permission gate uses it to say when a
+        background job is the one asking."""
+        return self._open.origin if self._open is not None else None
+
+    @property
+    def tasks_in_flight(self) -> int:
+        """Background tasks started and not yet finished."""
+        return sum(1 for i in self._tasks.values()
+                   if i.get("status") not in _TERMINAL)
+
+    # ---- lifecycle ----------------------------------------------------
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -273,6 +402,11 @@ class WarmBrain:
                 max_buffer_size=16 * 1024 * 1024,
                 skills=CFG["visible_skills"],
                 resume=rid,
+                # The CLI echoes every prompt back at the moment it TAKES
+                # IT IN, including when it folds one into a running turn
+                # (confirmed live, 2026-10-08). That echo is what ties an
+                # answer to its question; see _read_pipe.
+                extra_args={"replay-user-messages": None},
             )
         if resume:
             try:
@@ -280,6 +414,7 @@ class WarmBrain:
                 await self._client.connect()
                 log(f"[brain] resumed session {resume[:8]}")
                 self.resumed = True
+                self._spawn_reader()
                 return
             except Exception as e:
                 # a stale or invalid saved session must never brick the
@@ -292,6 +427,13 @@ class WarmBrain:
                     pass
         self._client = ClaudeSDKClient(options=_opts(None))
         await self._client.connect()
+        self._spawn_reader()
+
+    def _spawn_reader(self):
+        self.lost = False
+        self._echo_seen = False
+        self._reader = asyncio.get_running_loop().create_task(
+            self._read_pipe(self._client), name="backtalk-pipe-reader")
 
     async def reattach(self, sid: str):
         """Swap this live brain onto an older conversation.
@@ -377,7 +519,11 @@ class WarmBrain:
         wrong, and the containment is the point. Every failure is
         swallowed and the readout simply goes quiet. It must never cost
         a turn, so it is also bounded -- an unanswered control request
-        would otherwise hang the voice line mid-conversation."""
+        would otherwise hang the voice line mid-conversation.
+
+        Spawned as its own task by the pipe reader, NEVER awaited by it:
+        five seconds of a paused reader is exactly the backpressure stall
+        the reader exists to prevent."""
         if not CFG.get("show_usage"):
             return
         try:
@@ -403,230 +549,529 @@ class WarmBrain:
         except Exception:
             pass
 
+    # ---- the consumers: they never touch the pipe ----------------------
+
+    def _new_ticket(self, prompt: str, origin: str) -> _Ticket:
+        # abandoned questions whose echo never came: keep a few (a late
+        # echo still pairs with its own dead question), not forever
+        dead = [t for t in self._tickets if t.done and t.turn is None]
+        for t in dead[:-4]:
+            self._tickets.remove(t)
+        tk = _Ticket(prompt, origin, blind=not self._echo_seen)
+        self._tickets.append(tk)
+        return tk
+
+    async def _ensure_alive(self):
+        """A dead reader means a dead pipe: rebuild before asking."""
+        if self.lost or self._client is None or self._reader is None:
+            log("[brain] the pipe reader is gone — rebuilding the session "
+                "(conversation memory for this session resets)")
+            await self._rebuild()
+
+    async def _hold_if_blind(self) -> bool:
+        """Only when this connection has never echoed a prompt (an old
+        CLI): a question sent into an open turn could be folded into it
+        with nothing to mark where the answer starts. So hold it until
+        that turn ends, at most fg_hold_s. Returns True when the hold
+        ran out with the turn still open: the caller then counts that
+        turn as the answer from the moment the question goes out."""
+        t = self._open
+        if self._echo_seen or t is None:
+            return False
+        try:
+            hold = float(CFG.get("fg_hold_s") or 20)
+        except (TypeError, ValueError):
+            hold = 20.0
+        log(f"[reader] no prompt echo seen yet and a turn is open — "
+            f"holding the question up to {hold:g}s")
+        try:
+            await asyncio.wait_for(t.closed.wait(), hold)
+            return False
+        except asyncio.TimeoutError:
+            return self._open is t
+
     async def command(self, cmd: str) -> str:
         """Run a console slash command (/clear, /compact, /model,
-        /effort) through the normal stream and return whatever text the
-        CLI answered with (confirmations, errors). Slash-command replies
-        arrive as COMPLETE AssistantMessages, not stream deltas, so
-        ask_stream cannot see them. Bounded like reset_turn is: this
-        stream is not trusted to always deliver, and an unbounded await
-        here would deafen the whole voice loop. On timeout the pipe is
-        left marked dirty so the next reset_turn drains or rebuilds."""
-        self._dirty = True
+        /effort) and return whatever text the CLI answered with
+        (confirmations, errors). Slash-command replies arrive as
+        COMPLETE AssistantMessages, not stream deltas, so the reader
+        collects them on the command's own turn. Bounded: an unbounded
+        await here would deafen the whole voice loop. On timeout the
+        turn, if one opened, is left open for the next reset_turn."""
+        await self._ensure_alive()
+        tk = self._new_ticket(cmd, "cmd")
         await self._client.query(cmd)
-        texts = []
 
-        async def _collect():
-            async for msg in self._client.receive_response():
-                t = type(msg).__name__
-                if t == "AssistantMessage":
-                    for b in getattr(msg, "content", []) or []:
-                        txt = getattr(b, "text", None)
-                        if txt:
-                            texts.append(txt)
-                elif t == "ResultMessage":
-                    self._dirty = False
-                    self._tally(msg, count_turn=False)
-                    self._remember_session(msg)
-                    break
+        async def _settled():
+            await tk.ready.wait()
+            if tk.turn is not None:
+                await tk.turn.closed.wait()
 
         try:
-            await asyncio.wait_for(_collect(), 90)
+            await asyncio.wait_for(_settled(), 90)
         except asyncio.TimeoutError:
+            tk.done = True
             log(f"[brain] console command timed out: {cmd!r}")
             return "error: the command timed out"
-        return " ".join(texts).strip()
+        tk.done = True
+        if _norm(cmd).startswith("/clear"):
+            # a cleared conversation: whatever news was held belongs to
+            # the conversation that just went away
+            self._forget_tasks("rebuild")
+        t = tk.turn
+        return " ".join(t.texts).strip() if t is not None else ""
 
     async def interrupt(self):
-        if self._client:
-            await self._client.interrupt()
+        """Stop OUR turn. A background turn is never interrupted: its
+        work carries on, and only its speech is silenced (floor.py)."""
+        if not self._client:
+            return
+        if self._open is not None and self._open.origin == "bg":
+            log("[brain] not interrupting: the open turn is background "
+                "work, only its speech is silenced")
+            return
+        await self._client.interrupt()
 
     async def reset_turn(self, timeout: float = 8.0):
-        """Re-align the message pipe after an interrupted/failed turn.
+        """Make sure no turn of OURS is still running before the next
+        query goes out.
 
-        THE OFF-BY-ONE BUG, and why this method exists: the SDK client
-        has ONE shared message stream and receive_response() stops at
-        the FIRST ResultMessage it sees — there is no pairing between a
-        query and its response. A cancelled turn stops consuming
-        mid-stream, leaving the dead turn's remaining messages
-        (including its ResultMessage) buffered. The next query then
-        pairs with those leftovers: the first ask lands on the stale
-        ResultMessage and yields nothing, and every ask after that
-        answers the PREVIOUS question — for the rest of the session.
-        So: interrupt the dead turn, then drain the pipe through its
-        stale ResultMessage before the next query goes out. No-op when
-        the last turn was consumed clean."""
-        if not self._client or not self._dirty:
+        THE OFF-BY-ONE BUG this used to fix by draining: the SDK has ONE
+        shared message stream and no pairing between a query and its
+        response, so a cancelled turn's leftovers used to pair with the
+        next question. The single pipe reader (_read_pipe) makes the
+        pairing explicit instead, so there is nothing left to drain.
+        What remains is courtesy to the CLI: interrupt an open fg/cmd
+        turn and wait for its ResultMessage. If it never comes the
+        session is rebuilt rather than left wedged. No-op when no turn
+        of ours is open; a background turn is left running."""
+        t = self._open
+        if not self._client or t is None or t.origin == "bg":
             return
         try:
             await asyncio.wait_for(self._client.interrupt(), 5)
         except Exception:
-            pass  # turn may already be over — the drain below is the point
-
-        async def _drain() -> int:
-            n = 0
-            async for msg in self._client.receive_response():
-                n += 1
-                if type(msg).__name__ == "ResultMessage":
-                    break
-            return n
-
+            pass  # turn may already be over — the wait below is the point
         try:
-            drained = await asyncio.wait_for(_drain(), timeout)
-            log(f"[brain] interrupted turn drained ({drained} stale messages)")
-            self._dirty = False
-        except Exception:
-            # Can't re-align — rebuild the session rather than run
-            # desynced. Loses this voice session's conversation memory;
-            # better than answering every question one turn late for the
-            # rest of the day.
-            log("[brain] stream desynced beyond repair — rebuilding the "
+            await asyncio.wait_for(t.closed.wait(), timeout)
+            log(f"[brain] interrupted turn {t.id} closed cleanly")
+        except asyncio.TimeoutError:
+            # Can't confirm it ended — rebuild rather than run against a
+            # wedged turn. Loses this voice session's conversation memory.
+            log("[brain] interrupted turn never closed — rebuilding the "
                 "session (conversation memory for this session resets)")
+            await self._rebuild()
+
+    async def _rebuild(self):
+        await self._stop_reader()
+        self._close_all("rebuild")
+        if self._client is not None:
             try:
                 await self._client.disconnect()
             except Exception:
                 pass
-            self._client = None
-            await self.start()
-            self._dirty = False
+        self._client = None
+        await self.start()
+
+    async def _stop_reader(self):
+        """Cancel the reader and WAIT for it, so two readers can never
+        overlap on one pipe (or a dead client's reader on a new one)."""
+        task, self._reader = self._reader, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for side in list(self._side):
+            side.cancel()
 
     async def stop(self):
+        await self._stop_reader()
+        self._close_all("rebuild")
         if self._client:
             await self._client.disconnect()
             self._client = None
 
-    def _drain_idle(self) -> bool:
-        """Throw away whatever a BACKGROUND turn left in the pipe.
-
-        THE OTHER OFF-BY-ONE: the agent can take turns nobody asked for
-        — background-task notifications (a finished Bash job, a Monitor
-        event, a timeout) wake the model while the mic is quiet, and it
-        answers. Nothing here is reading the stream at that moment, so
-        that answer (text + ResultMessage) sits buffered. The next real
-        question then pairs with it: the person hears the reply to the
-        notification, and every answer after that is one question late.
-        reset_turn can't see it (the turn wasn't ours, _dirty is False).
-        So before every query: pull everything already buffered, non-
-        blocking, and log what got dropped. Returns True when the last
-        drained message shows a background turn still in flight (text
-        without its ResultMessage) — the caller then waits for that
-        turn to finish before sending, or the same pairing breaks."""
-        q = getattr(self._client, "_query", None)
-        rx = getattr(q, "_message_receive", None)
-        if rx is None:
-            return False
-        n, open_turn, texts = 0, False, []
-        while True:
-            try:
-                m = rx.receive_nowait()
-            except anyio.WouldBlock:
-                break
-            except Exception:
-                break
-            t = m.get("type") if isinstance(m, dict) else None
-            if t in ("end", "error"):
-                # Lifecycle markers — put them back for receive_messages
-                # to handle; nothing after them matters.
-                try:
-                    q._message_send.send_nowait(m)
-                except Exception:
-                    pass
-                break
-            n += 1
-            if t == "result":
-                open_turn = False
-            elif t == "assistant":
-                open_turn = True
-                for b in (m.get("message", {}) or {}).get("content", []) or []:
-                    if isinstance(b, dict) and b.get("type") == "text":
-                        texts.append((b.get("text") or "").strip())
-            elif t in ("user", "stream_event"):
-                open_turn = True
-        if n:
-            log(f"[brain] dropped {n} buffered messages from a background "
-                f"turn (not spoken; see below)")
-            for x in texts:
-                if x:
-                    log(f"[brain] (unspoken) {x[:300]}")
-        return open_turn
-
     async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
-        if self._drain_idle():
-            # A background turn is mid-flight: let it finish (bounded)
-            # so our question can't pair with its ResultMessage.
-            async def _finish():
-                async for msg in self._client.receive_response():
-                    if type(msg).__name__ == "ResultMessage":
-                        break
-            try:
-                await asyncio.wait_for(_finish(), 30)
-                log("[brain] waited out an in-flight background turn")
-            except Exception:
-                log("[brain] background turn didn't finish in 30s — "
-                    "sending anyway")
-        self._dirty = True             # in flight until its ResultMessage
-        await self._client.query(utterance)
-        buf = ""
-        # The activity file on the bus is cleared in the finally: it
-        # covers the clean finish (ResultMessage), a cancelled turn (the
-        # interrupt lands at the await below and unwinds through here),
-        # and a failed one, so no stale "Read: foo.py" ever outlives its
-        # turn on the face.
+        """Yield complete sentences of the answer to THIS question.
+
+        Never reads the pipe: it files a ticket, sends the question and
+        reads the sentences the reader routes to the ticket's turn. The
+        activity file on the bus is cleared in the finally: it covers
+        the clean finish, a cancelled turn and a failed one, so no stale
+        "Read: foo.py" ever outlives its turn on the face."""
+        await self._ensure_alive()
+        forced = await self._hold_if_blind()
+        tk = self._new_ticket(utterance, "fg")
         try:
-            async for msg in self._client.receive_response():
-                t = type(msg).__name__
-                if t == "StreamEvent":
-                    ev = getattr(msg, "event", {}) or {}
-                    if ev.get("type") == "content_block_delta":
-                        delta = ev.get("delta", {}) or {}
-                        if delta.get("type") == "text_delta":
-                            buf += delta.get("text", "")
-                            # emit any complete sentences
-                            while True:
-                                m = _SENTENCE_END.search(buf)
-                                if not m:
-                                    break
-                                sentence, buf = (buf[:m.end()].strip(),
-                                                 buf[m.end():])
-                                if sentence:
-                                    yield sentence
-                    elif ev.get("type") == "content_block_stop":
-                        # End of a speech block (e.g. right before a
-                        # tool call): flush NOW. Without this, pre-tool
-                        # filler ("On it — let me grab that.") sits
-                        # silent in the buffer through the whole tool
-                        # run, then plays glued to the answer: long
-                        # dead air, then two thoughts at once.
-                        tail = buf.strip()
-                        buf = ""
-                        if tail:
-                            yield tail
-                elif t == "AssistantMessage":
-                    # The complete message lands right as its tool
-                    # calls run: print what the agent is DOING while
-                    # the voice is quiet, so a long silence never reads
-                    # as a dead line — and put the same line on the bus
-                    # so the face can show it.
-                    for b in getattr(msg, "content", []) or []:
-                        if type(b).__name__ == "ToolUseBlock":
-                            line = _tool_line(b.name, b.input,
-                                              prefix=False)
-                            log(f"[tool] {line}")
-                            signals.activity(line)
-                elif t == "ResultMessage":
-                    self._dirty = False  # turn fully consumed — aligned
-                    self._tally(msg)
-                    self._remember_session(msg)
-                    # theirs, kept: the plan-usage pull that writes
-                    # .voice_rate_limits, which every face now displays.
-                    await self._pull_rate_limits()
+            await self._client.query(utterance)
+            if forced and self._open is not None and self._open.ticket is None:
+                log("[reader] no echo and the open turn ran past "
+                    "fg_hold_s — counting it as the answer from here")
+                self._attach(tk)
+            await tk.ready.wait()
+            t = tk.turn
+            if t is None:
+                return
+            while True:
+                s = await t.sentences.get()
+                if s is None:
                     break
+                yield s
         finally:
+            tk.done = True
             signals.turn_end()
-        tail = buf.strip()
+
+    # ---- THE SINGLE PIPE READER ---------------------------------------
+
+    async def _read_pipe(self, client):
+        """The only code anywhere that iterates the SDK's message stream.
+
+        WHY ONE READER (2026-10-08). The agent takes turns nobody asked
+        for: a background agent or job finishes and wakes the model, and
+        it answers. With the pipe read only while one of OUR turns ran,
+        that answer sat in the SDK's 100-message buffer, and the SDK's
+        own reader does a BLOCKING send into that buffer in the same loop
+        that answers permission prompts and hooks. A background turn
+        filled it in seconds, froze mid-sentence with its permission
+        requests unanswered, and the rest of it was paired with the
+        person's next question. Reading every frame the moment it lands
+        means the buffer never fills.
+
+        So this drains everything, always, and routes it:
+          - a turn opens at its first main-thread frame and closes at
+            its ResultMessage. Sub-agent frames (parent_tool_use_id set)
+            never open a turn and are never spoken.
+          - the echo of a prompt we sent (replay-user-messages) claims
+            everything after it, to the next ResultMessage, for that
+            prompt's ticket: an fg answer, or a cmd reply. A turn that
+            opens with no echo is background (bg).
+          - fg sentences go to the ticket's turn queue (ask_stream), bg
+            ones to self.events (the floor), cmd text is collected.
+
+        It never awaits anything slow: queues are unbounded, file writes
+        are tiny and synchronous, and the rate-limit pull is spawned."""
+        log("[reader] listening on the message pipe")
+        why = "the message stream ended"
+        try:
+            async for msg in client.receive_messages():
+                try:
+                    self._on_frame(msg)
+                except Exception as e:
+                    log(f"[reader] frame skipped after an error: {e!r}"[:300])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            why = f"{e!r}"[:200]
+        if client is self._client:
+            self._lose(why)
+
+    def _lose(self, why: str):
+        self.lost = True
+        log(f"[reader] the pipe reader died ({why}) — the next question "
+            f"rebuilds the session")
+        self._close_all("brain_lost")
+
+    def _emit(self, ev: BgEvent):
+        self.events.put_nowait(ev)
+
+    def _spawn(self, coro):
+        task = asyncio.get_running_loop().create_task(coro)
+        self._side.add(task)
+        task.add_done_callback(self._side.discard)
+
+    def _on_frame(self, msg):
+        kind = type(msg).__name__
+        if kind == "StreamEvent":
+            self._on_stream(msg)
+        elif kind == "AssistantMessage":
+            self._on_assistant(msg)
+        elif kind == "UserMessage":
+            self._on_user(msg)
+        elif kind == "ResultMessage":
+            self._on_result(msg)
+        elif isinstance(getattr(msg, "subtype", None), str):
+            self._on_system(msg)
+
+    def _on_stream(self, msg):
+        if getattr(msg, "parent_tool_use_id", None) is not None:
+            return                      # sub-agent: never spoken
+        t = self._turn_for_frame()
+        ev = getattr(msg, "event", {}) or {}
+        et = ev.get("type")
+        if et == "content_block_delta":
+            delta = ev.get("delta", {}) or {}
+            if delta.get("type") == "text_delta":
+                t.buf += delta.get("text", "")
+                while True:
+                    m = _SENTENCE_END.search(t.buf)
+                    if not m:
+                        break
+                    sentence, t.buf = (t.buf[:m.end()].strip(),
+                                       t.buf[m.end():])
+                    if sentence:
+                        self._sentence(t, sentence)
+        elif et == "content_block_stop":
+            # End of a speech block (e.g. right before a tool call):
+            # flush NOW. Without this, pre-tool filler ("On it — let me
+            # grab that.") sits silent in the buffer through the whole
+            # tool run, then plays glued to the answer.
+            tail = t.buf.strip()
+            t.buf = ""
+            if tail:
+                self._sentence(t, tail)
+
+    def _on_assistant(self, msg):
+        sub = getattr(msg, "parent_tool_use_id", None) is not None
+        t = self._open if sub else self._turn_for_frame()
+        for b in getattr(msg, "content", []) or []:
+            bn = type(b).__name__
+            if bn == "ToolUseBlock":
+                # The complete message lands right as its tool calls run:
+                # print what the agent is DOING while the voice is quiet,
+                # and put the same line on the bus for the face.
+                line = _tool_line(b.name, b.input, prefix=False)
+                if t is not None and t.origin == "bg":
+                    line = "background: " + line
+                log(f"[tool] {line}")
+                signals.activity(line)
+            elif bn == "TextBlock" and not sub and t is not None:
+                txt = getattr(b, "text", None)
+                if txt:
+                    t.texts.append(txt)
+
+    def _on_user(self, msg):
+        if getattr(msg, "parent_tool_use_id", None) is not None:
+            return
+        origin = getattr(msg, "origin", None)
+        okind = origin.get("kind") if isinstance(origin, dict) else None
+        text = _prompt_text(getattr(msg, "content", None))
+        if text is not None and okind in (None, "human"):
+            tk = self._match(text)
+            if tk is not None:
+                self._echo_seen = True
+                self._attach(tk)
+            else:
+                log(f"[reader] a replayed prompt matched no question "
+                    f"(ignored): {text[:80]!r}")
+            return
+        if okind and okind != "human":
+            # news injected into the conversation (a task notification,
+            # a peer or channel message)
+            self._claim_news(self._turn_for_frame())
+            return
+        self._turn_for_frame()          # a tool result: part of the turn
+
+    def _on_result(self, msg):
+        t = self._open
+        if t is None:
+            tk = self._fallback_ticket()
+            if tk is None:
+                log("[reader] a result arrived with no turn open (ignored)")
+                return
+            t = self._attach(tk)
+        ro = getattr(msg, "origin", None)
+        rkind = ro.get("kind") if isinstance(ro, dict) else None
+        if t.origin == "bg" and rkind in (None, "human"):
+            # CROSS-CHECK: the CLI says this turn answered a prompt WE
+            # sent, but no echo claimed it. Give the waiting asker its
+            # end-of-turn rather than leave it hanging forever.
+            tk = next((x for x in self._tickets
+                       if x.turn is None and not x.done), None)
+            if tk is not None:
+                log(f"[reader] cross-check: turn {t.id} answered our "
+                    f"{tk.origin} prompt but its echo never matched")
+                self._tickets.remove(tk)
+                tk.turn = t if tk.origin == "cmd" else None
+                tk.ready.set()
+        elif t.origin != "bg" and rkind not in (None, "human"):
+            log(f"[reader] turn {t.id} ({t.origin}) was folded into a "
+                f"{rkind} turn")
+        self._close(t, "result", msg)
+        if t.origin == "fg":
+            self._tally(msg)
+            self._remember_session(msg)
+            signals.turn_end()
+            # theirs, kept: the plan-usage pull that writes
+            # .voice_rate_limits. Spawned, never awaited (see docstring).
+            self._spawn(self._pull_rate_limits())
+        elif t.origin == "cmd":
+            self._tally(msg, count_turn=False)
+            self._remember_session(msg)
+        elif not any(x.turn is None and not x.done for x in self._tickets):
+            signals.turn_end()          # no stale background activity line
+
+    def _on_system(self, msg):
+        sub = getattr(msg, "subtype", None)
+        data = getattr(msg, "data", None) or {}
+        tid = getattr(msg, "task_id", None) or data.get("task_id")
+        if not tid:
+            return
+        if sub == "task_started":
+            self._tasks[tid] = {
+                "id": tid,
+                "description": (getattr(msg, "description", None)
+                                or data.get("description") or ""),
+                "type": (getattr(msg, "task_type", None)
+                         or data.get("task_type")),
+                "status": "running"}
+        elif sub == "task_notification":
+            self._task_done(tid, getattr(msg, "status", None)
+                            or data.get("status"))
+        elif sub == "task_updated":
+            st = (getattr(msg, "status", None)
+                  or (data.get("patch") or {}).get("status"))
+            if st in _TERMINAL:
+                self._task_done(tid, st)
+
+    def _task_done(self, tid, status):
+        info = self._tasks.get(tid)
+        if info is None:                # never saw it start: "Something"
+            info = {"id": tid, "description": "", "type": None}
+            self._tasks[tid] = info
+        if info.get("status") in _TERMINAL:
+            return                      # reported twice: once is enough
+        info["status"] = status or "completed"
+        self._done.append(info)
+        log(f"[reader] task {info.get('description') or tid} "
+            f"{info['status']} ({self.tasks_in_flight} still running)")
+        self._emit(BgEvent(BgEvent.TASK_DONE, info=dict(info)))
+
+    def _forget_tasks(self, reason: str):
+        self._tasks.clear()
+        self._done.clear()
+        self._emit(BgEvent(BgEvent.RESET, reason=reason))
+
+    # ---- attribution -----------------------------------------------------
+
+    def _match(self, text: str) -> _Ticket | None:
+        """FIFO, content equality (after whitespace), the oldest first.
+        Live tickets before abandoned ones: a question asked again after
+        an interrupt must never lose its echo to the dead copy."""
+        n = _norm(text)
+        for want_done in (False, True):
+            for tk in self._tickets:
+                if tk.turn is not None or tk.done != want_done:
+                    continue
+                if tk.norm == n or (len(tk.norm) >= 8 and tk.norm in n):
+                    return tk
+                if tk.cmdword and tk.cmdword in n:
+                    return tk
+        return None
+
+    def _fallback_ticket(self) -> _Ticket | None:
+        """A turn (or result) arrived with no echo in front of it. It is
+        background, unless the oldest live ticket is a slash command
+        (local commands are not guaranteed to echo) or this connection
+        has never echoed anything (an old CLI: turn order is all we
+        have)."""
+        tk = next((x for x in self._tickets
+                   if x.turn is None and not x.done), None)
+        if tk is None:
+            return None
+        if tk.origin == "cmd" or (tk.blind and not self._echo_seen):
+            return tk
+        return None
+
+    def _attach(self, tk: _Ticket) -> Turn:
+        """From this frame on, the turn belongs to the ticket. A turn
+        that was already open (a background turn the question was
+        folded into, or an older question's) ends here."""
+        old = self._open
+        if old is not None:
+            self._close(old, "folded")
+        # anything older than this ticket whose asker has gone, and whose
+        # echo will evidently never come, is dead weight
+        # (except an identical question: _match handed this echo to the
+        # live copy, so the dead copy's own echo is still to come)
+        idx = self._tickets.index(tk) if tk in self._tickets else -1
+        for stale in self._tickets[:max(idx, 0)]:
+            if stale.done and stale.turn is None and stale.norm != tk.norm:
+                self._tickets.remove(stale)
+                stale.ready.set()
+        if tk in self._tickets:
+            self._tickets.remove(tk)
+        t = Turn(tk.origin, tk)
+        self._open = t
+        tk.turn = t
+        tk.ready.set()
+        log(f"[reader] turn {t.id} opened ({t.origin}"
+            + (f", folded into turn {old.id}" if old is not None else "")
+            + ")")
+        return t
+
+    def _turn_for_frame(self) -> Turn:
+        if self._open is not None:
+            return self._open
+        tk = self._fallback_ticket()
+        if tk is not None:
+            log(f"[reader] a turn opened with no echo — pairing it with "
+                f"the pending {tk.origin} (fallback)")
+            return self._attach(tk)
+        t = Turn("bg")
+        t.info = self._done.popleft() if self._done else None
+        self._open = t
+        what = (t.info or {}).get("description") or "unknown source"
+        log(f"[reader] turn {t.id} opened (bg: {what})")
+        self._emit(BgEvent(BgEvent.TURN_OPEN, t.id, info=t.info))
+        return t
+
+    def _claim_news(self, t: Turn):
+        info = self._done.popleft() if self._done else None
+        what = (info or {}).get("description") or "a notification"
+        if t.origin == "bg":
+            log(f"[reader] news ({what}) folded into background turn {t.id}")
+            return
+        t.saw_news = True
+        log(f"[reader] news ({what}) folded into turn {t.id} — the model "
+            f"tells it, no template")
+
+    def _sentence(self, t: Turn, s: str):
+        t.count += 1
+        if t.origin == "fg":
+            if t.ticket is not None and t.ticket.done:
+                t.lost_text.append(s)
+            else:
+                t.sentences.put_nowait(s)
+        elif t.origin == "bg":
+            self._emit(BgEvent(BgEvent.SENTENCE, t.id, text=s))
+
+    def _close(self, t: Turn, reason: str, result=None):
+        tail = t.buf.strip()
+        t.buf = ""
         if tail:
-            yield tail
+            self._sentence(t, tail)
+        t.reason = reason
+        t.result = result
+        if t.origin == "fg":
+            if t.ticket is not None and t.ticket.done:
+                while not t.sentences.empty():
+                    s = t.sentences.get_nowait()
+                    if s is not None:
+                        t.lost_text.append(s)
+                if t.lost_text:
+                    signals.unspoken(
+                        "fg", "interrupted" if reason in ("result", "folded")
+                        else reason, " ".join(t.lost_text))
+            t.sentences.put_nowait(None)
+        elif t.origin == "bg":
+            self._emit(BgEvent(BgEvent.TURN_CLOSE, t.id, info=t.info,
+                               reason=reason))
+        t.closed.set()
+        if self._open is t:
+            self._open = None
+        log(f"[reader] turn {t.id} closed ({t.origin}, {reason}, "
+            f"{t.count} sentences"
+            + (", news folded in" if t.saw_news else "") + ")")
+
+    def _close_all(self, reason: str):
+        if self._open is not None:
+            self._close(self._open, reason)
+        for tk in self._tickets:
+            tk.ready.set()              # turn stays None: nothing coming
+        self._tickets.clear()
+        self._forget_tasks(reason)
 
 
 def _tool_line(name: str, inp, prefix: bool = True) -> str:

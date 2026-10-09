@@ -376,8 +376,17 @@ class _Render:
     PCM blocks stream through `pcm` as they render (rate is set before
     the first one lands), _DONE closes it. `gen` is the barge-in
     generation the chunk was ordered under; stale means shut_up() has
-    happened since and the chunk must never play."""
-    __slots__ = ("text", "gen", "pcm", "rate", "directions")
+    happened since and the chunk must never play.
+
+    Created at ENQUEUE time, not render time, and handed back to the
+    caller: the floor (floor.py) keeps the record so it can tell which of
+    the chunks it fed are still waiting, which one is playing, and which
+    were pulled back. `started`/`finished` are set by the player,
+    `dropped` by yield_floor() or shut_up(), all under Mouth._lock. A
+    dropped render is never played, and the synth thread stops making
+    audio for it the moment it notices."""
+    __slots__ = ("text", "gen", "pcm", "rate", "directions",
+                 "started", "finished", "dropped")
 
     def __init__(self, text: str, gen: int, directions=None):
         self.text = text
@@ -386,6 +395,9 @@ class _Render:
         self.directions = directions
         self.pcm: queue.Queue = queue.Queue()
         self.rate: int | None = None
+        self.started = False
+        self.finished = False
+        self.dropped = False
 
 
 class Mouth:
@@ -402,6 +414,9 @@ class Mouth:
         # of playback, so the speaking flag and wait_done key off this.
         self._gen = 0
         self._pending = 0
+        # Every current-generation render not yet finished, in order: what
+        # yield_floor() walks to find the chunks that have not started.
+        self._order: list[_Render] = []
         self._lock = threading.Lock()
         # The one persistent output stream (audio law #1).
         # Player-thread-only — never touch from other threads.
@@ -416,6 +431,14 @@ class Mouth:
     @property
     def speaking(self) -> bool:
         return self._speaking.is_set()
+
+    @property
+    def outstanding(self) -> int:
+        """Chunks queued, rendering or playing in the current generation.
+        The floor paces itself on this (one playing, one rendered ahead)
+        instead of handing a whole reply over at once."""
+        with self._lock:
+            return max(0, self._pending)
 
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
@@ -432,7 +455,8 @@ class Mouth:
         is why they travel with it instead of firing at parse time."""
         text = text.strip()
         if text:
-            self._enqueue(text, directions)
+            return self._enqueue(text, directions)
+        return None
 
     def _enqueue(self, text: str, directions=None):
         """MERGED 2026-09-02. Two designs met on this one queue: ours
@@ -442,8 +466,60 @@ class Mouth:
         audio starts. Neither is optional, so the item carries all three
         and nothing was dropped."""
         with self._lock:
+            r = _Render(text, self._gen, directions or None)
             self._pending += 1
-            self._q.put((self._gen, text, directions or None))
+            self._order.append(r)
+            self._q.put(r)
+        return r
+
+    def yield_floor(self) -> list:
+        """Pull back every chunk that has not started playing and return
+        them, in order, as (text, directions). The chunk that IS playing
+        always finishes: this is the floor making room for news at the
+        next chunk boundary, not a barge-in.
+
+        LAND MINE: this must NEVER touch _gen. Bumping the generation is
+        shut_up()'s job, and it would cut the playing chunk mid-word (see
+        TROUBLESHOOTING point 6). Instead each pulled render is flagged
+        `dropped`: the player skips it, the synth thread stops rendering
+        it, and _pending is corrected here so the reply never looks
+        finished in between (no reply_done, no idle flicker)."""
+        out = []
+        with self._lock:
+            keep = []
+            for r in self._order:
+                if r.gen == self._gen and not r.started and not r.dropped:
+                    r.dropped = True
+                    self._pending -= 1
+                    out.append((r.text, r.directions))
+                elif not r.dropped:
+                    keep.append(r)
+            self._order = keep
+        # Take the dropped renders out of both queues: that frees the
+        # lookahead slots for whatever the floor queues next. Anything NOT
+        # dropped goes back in order -- another thread (the greeting, a
+        # console line) may have enqueued between the lock and here, and
+        # discarding it would leave _pending counting a chunk that never
+        # plays, i.e. a mouth stuck "speaking" forever.
+        for q_ in (self._q, self._ready):
+            kept = []
+            try:
+                while True:
+                    item = q_.get_nowait()
+                    if not item.dropped:
+                        kept.append(item)
+            except queue.Empty:
+                pass
+            for item in kept:
+                try:
+                    q_.put_nowait(item)   # never block the caller's loop
+                except queue.Full:
+                    log("[mouth] yield_floor: lookahead full, a chunk "
+                        "was lost re-queueing")
+                    with self._lock:
+                        item.dropped = True
+                        self._pending -= 1
+        return out
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued
@@ -453,6 +529,10 @@ class Mouth:
         with self._lock:
             self._gen += 1
             self._pending = 0
+            for r in self._order:
+                if not r.finished:
+                    r.dropped = True
+            self._order = []
         self._stop.set()
         for q_ in (self._q, self._ready):
             try:
@@ -482,15 +562,20 @@ class Mouth:
         chunk still starts after the prebuffer rather than after the
         whole render; _ready's bound is what throttles the lookahead."""
         while True:
-            gen, text, directions = self._q.get()
-            if gen != self._gen:
+            r = self._q.get()
+            gen = r.gen
+            if gen != self._gen or r.dropped:
                 continue
-            r = _Render(text, gen, directions)
             self._ready.put(r)
+            if r.dropped:
+                # pulled back while waiting for a lookahead slot: the
+                # player skips it, so do not render a word of it
+                r.pcm.put(_DONE)
+                continue
             try:
-                for rate, pcm in synth_stream(text):
-                    if gen != self._gen:
-                        break     # barged in: don't finish a dead chunk
+                for rate, pcm in synth_stream(r.text):
+                    if gen != self._gen or r.dropped:
+                        break     # barged in / pulled back: stop rendering
                     r.rate = rate
                     r.pcm.put(pcm)
             except Exception as e:
@@ -503,8 +588,12 @@ class Mouth:
         while True:
             r = self._ready.get()
             self._stop.clear()
-            if r.gen != self._gen:
-                continue
+            with self._lock:
+                if r.gen != self._gen or r.dropped:
+                    # stale, or pulled back by yield_floor(): its _pending
+                    # was already settled by whoever dropped it
+                    continue
+                r.started = True
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
@@ -515,8 +604,13 @@ class Mouth:
                 log(f"[mouth] synth/play error: {e}")
             finally:
                 with self._lock:
+                    r.finished = True
                     if r.gen == self._gen:
                         self._pending -= 1
+                        try:
+                            self._order.remove(r)
+                        except ValueError:
+                            pass
                     done = self._pending <= 0
                 if done:
                     self._speaking.clear()
