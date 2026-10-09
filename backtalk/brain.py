@@ -54,6 +54,7 @@ except ImportError:                       # older SDKs: nothing to silence
 
 from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
+from backtalk.jobs import UNKNOWN, job_label
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
@@ -916,6 +917,9 @@ class WarmBrain:
                 "type": (getattr(msg, "task_type", None)
                          or data.get("task_type")),
                 "status": "running"}
+            # one short name for the job, shared by the log, the floor's
+            # lines and .voice_unspoken (backtalk/jobs.py)
+            self._tasks[tid]["label"] = job_label(self._tasks[tid])
         elif sub == "task_notification":
             self._task_done(tid, getattr(msg, "status", None)
                             or data.get("status"))
@@ -928,13 +932,14 @@ class WarmBrain:
     def _task_done(self, tid, status):
         info = self._tasks.get(tid)
         if info is None:                # never saw it start: "Something"
-            info = {"id": tid, "description": "", "type": None}
+            info = {"id": tid, "description": "", "type": None,
+                    "label": UNKNOWN}
             self._tasks[tid] = info
         if info.get("status") in _TERMINAL:
             return                      # reported twice: once is enough
         info["status"] = status or "completed"
         self._done.append(info)
-        log(f"[reader] task {info.get('description') or tid} "
+        log(f"[reader] task \"{info.get('label') or UNKNOWN}\" "
             f"{info['status']} ({self.tasks_in_flight} still running)")
         self._emit(BgEvent(BgEvent.TASK_DONE, info=dict(info)))
 
@@ -1012,14 +1017,14 @@ class WarmBrain:
         t = Turn("bg")
         t.info = self._done.popleft() if self._done else None
         self._open = t
-        what = (t.info or {}).get("description") or "unknown source"
+        what = (t.info or {}).get("label") or "unknown source"
         log(f"[reader] turn {t.id} opened (bg: {what})")
         self._emit(BgEvent(BgEvent.TURN_OPEN, t.id, info=t.info))
         return t
 
     def _claim_news(self, t: Turn):
         info = self._done.popleft() if self._done else None
-        what = (info or {}).get("description") or "a notification"
+        what = (info or {}).get("label") or "a notification"
         if t.origin == "bg":
             log(f"[reader] news ({what}) folded into background turn {t.id}")
             return

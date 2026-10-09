@@ -237,10 +237,11 @@ DEFAULTS = {
     # Nothing is ever spoken while the key is held, while the open mic
     # is catching an utterance, or while a permission question waits.
     "background_speech": "off",
-    # The lines that frame background news. {what} names the job ("the
-    # build-the-APK agent", "Something" when unknown), {status} is
-    # "finished", "failed" or "was stopped". Plain on purpose: make them
-    # sound like your agent in your own backtalk.json.
+    # The lines that frame background news. {what} names the job the
+    # way you would say it ("the agent building the APK", "the Beepies
+    # test run", "Something" when unknown; backtalk/jobs.py), {status}
+    # is "finished", "failed" or "got stopped". Plain on purpose: make
+    # them sound like your agent in your own backtalk.json.
     "background_lines": {
         "interrupt": "Hold on, we're being interrupted. {what} just {status}.",
         "idle": "Heads up. {what} just {status}.",

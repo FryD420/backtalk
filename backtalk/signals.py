@@ -189,7 +189,8 @@ def unspoken(origin: str, reason: str, text: str, what=None,
     nobody asked for). reason is one of: interrupted, silenced, capped,
     backlog, too_old, no_text, rebuild, brain_lost, shutdown,
     speech_off. partial marks the chunk that was playing when it was
-    cut. what names the background job, when known.
+    cut. what is the background job's short label ("Build the
+    APK", backtalk/jobs.py), when known.
 
     Appended, and trimmed to the newest 200 lines once the file passes
     256 KB. Like every bus write, it never raises. Each record is also

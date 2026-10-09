@@ -44,8 +44,10 @@ from fakes import (FakeClient, FakeMouth, NOTIF, Unspoken,  # noqa: E402
                    check_factory, message_start, notif_user, result, text)
 
 from backtalk.brain import BgEvent  # noqa: E402
-from backtalk.floor import (BG_SPEAK, IDLE, INTERRUPTING, Chunker,  # noqa
-                            Floor, describe_task)
+from backtalk.floor import (BG_SPEAK, DEFAULT_LINES, IDLE,  # noqa: E402
+                            INTERRUPTING, Chunker, Floor, describe_task,
+                            fill_line)
+from backtalk.jobs import job_label  # noqa: E402
 
 failures: list = []
 check = check_factory(failures)
@@ -141,7 +143,7 @@ def t1_idle_news():
     r.news(["It built clean.", "It's on your S23."])
     heard = r.play()
     check("1. idle news: the idle line, then the news",
-          heard == ["Heads up. The build-the-APK agent just finished.",
+          heard == ["Heads up. The agent building the APK just finished.",
                     "It built clean.", "It's on your S23."])
     check("1. back to idle afterwards", r.floor.state == IDLE)
 
@@ -160,7 +162,7 @@ def t2_interrupt():
     r.floor.fg_done(r.floor._fg_token)
     heard = r.play()
     want = [S[0], S[1], S[2],
-            "Hold on, we're being interrupted. The build-the-APK agent "
+            "Hold on, we're being interrupted. The agent building the APK "
             "just finished.",
             "It built clean.",
             "Right, back to what I was saying.",
@@ -181,7 +183,7 @@ def t3_key_held():
     r.user = False
     heard = r.play()
     check("3. released: the held news plays",
-          heard == ["Heads up. The run-the-test-suite job just finished.",
+          heard == ["Heads up. The job running the test suite just finished.",
                     "All eleven pass."])
 
 
@@ -205,7 +207,7 @@ def t4_permission():
     # cuts in at that boundary and the answer resumes after it
     check("4. once answered, the held news plays and the answer resumes",
           heard[4:] == ["Hold on, we're being interrupted. The "
-                        "build-the-APK agent just finished.",
+                        "agent building the APK just finished.",
                         "It built clean.",
                         "Right, back to what I was saying.",
                         S[1] + " " + S[2]])
@@ -302,7 +304,7 @@ def t7_no_text():
           r.play() == [])
     check("7. ...and a no_text record that names it",
           r.file.records and r.file.records[0]["reason"] == "no_text"
-          and r.file.records[0]["what"] == "the build-the-APK agent")
+          and r.file.records[0]["what"] == "Build the APK")
 
 
 def t8_cap_and_backlog():
@@ -328,7 +330,7 @@ def t8_cap_and_backlog():
     r.user = False
     heard = r.play()
     check("8. the three newest are spoken, chained with 'another'",
-          heard == ["Heads up. The job-2 job just finished.", "Job 2 done.",
+          heard == ["Heads up. Job 2 just finished.", "Job 2 done.",
                     "And another one.", "Job 3 done.",
                     "And another one.", "Job 4 done."])
 
@@ -353,8 +355,8 @@ def t10_while_you_talked():
     heard = r.play()
     check("10. the answer first, then while_you_talked and the news",
           heard == ["Here's the answer.", "That's all.",
-                    "Also, while you were talking: the run-the-test-suite "
-                    "job finished.", "All eleven pass."])
+                    "Also, while you were talking: the job running the "
+                    "test suite finished.", "All eleven pass."])
 
 
 def t_off_idle_too_old():
@@ -374,7 +376,7 @@ def t_off_idle_too_old():
     r.floor.fg_done(r.floor._fg_token)
     heard = r.play()
     check("idle: the news follows the answer with the idle line",
-          heard[-2:] == ["Heads up. The build-the-APK agent just finished.",
+          heard[-2:] == ["Heads up. The agent building the APK just finished.",
                          "It built clean."] and heard.count(S[3] + " "
                                                             + S[4]) == 1)
 
@@ -408,7 +410,7 @@ def t_park():
     r.more(tid, ["Deploy finished."], close=True)
     heard = r.play()
     check("park: the rest of the news is told after the answer",
-          heard[-2:] == ["Heads up. The build-the-APK agent just finished.",
+          heard[-2:] == ["Heads up. The agent building the APK just finished.",
                          "Deploy finished."])
     check("park: every answer sentence exactly once",
           all(heard.count(s) == 1 for s in S[:4]))
@@ -485,13 +487,58 @@ def t_shutdown():
 
 
 def t_describe():
-    check("describe: an agent", describe_task(APK) == "the build-the-APK agent")
-    check("describe: paths and backticks removed, 8 words max",
-          describe_task({"description": "`fix` E:/x/y.py and then run all "
-                                        "of the many many tests",
-                         "type": "local_bash"})
-          == "the fix-and-then-run-all-of-the-many job")
+    """Job names read naturally out loud (backtalk/jobs.py): no hyphen
+    chains, no raw shell commands, one short label for screens."""
+    check("describe: an agent",
+          describe_task(APK) == "the agent building the APK")
+    check("describe: a job", describe_task(TESTS)
+          == "the job running the test suite")
     check("describe: unknown is Something", describe_task(None) == "Something")
+    check("describe: no description is Something",
+          describe_task({"description": "", "type": None}) == "Something")
+    check("label: the agent's own title, sentence case",
+          job_label(APK) == "Build the APK"
+          and job_label(TESTS) == "Run the test suite")
+    check("label: unknown is Something", job_label(None) == "Something")
+    log = {"description": "Log state in daily note and back up",
+           "type": "local_bash"}
+    check("describe: verbs after 'and' stay parallel",
+          describe_task(log)
+          == "the job logging state in daily note and backing up")
+    check("label: first clause only, paths dropped",
+          job_label({"description": "Dry-run fetch all remotes per stack "
+                                    "repo, show exit codes"})
+          == "Dry-run fetch all remotes per stack repo"
+          and job_label({"description": "`fix` E:/x/y.py and then run all "
+                                        "of the many many tests"})
+          == "Fix and then run all of the many")
+    check("describe: a noun-phrase title is said as is",
+          describe_task({"description": "Beepies build",
+                         "type": "local_agent"}) == "Beepies build")
+    npm = {"description": "cd /e/dev/beepies-spike-step2/server && npm ci "
+                          "2>&1 | tail -3 && npm test 2>&1 | tail -12",
+           "type": "local_bash"}
+    check("raw command: project + what it did",
+          job_label(npm) == "Beepies spike test run"
+          and describe_task(npm) == "the Beepies spike test run")
+    heredoc = {"description": "cd /e/dev/beepies-spike-step2/server && "
+                              "python - <<'EOF'\nimport x\nEOF",
+               "type": "local_bash"}
+    check("raw command: a heredoc is one short line",
+          job_label(heredoc) == "Beepies spike command")
+    check("raw command: git push through -C",
+          job_label({"description": "git -C /e/my-agent/jarvis-gui push "
+                                    "origin main"}) == "Jarvis gui push")
+    check("raw command: no path, still short",
+          describe_task({"description": "sleep 20 && echo done"})
+          == "the timer")
+    check("filled line, start to end",
+          fill_line(DEFAULT_LINES["idle"], dict(npm, status="completed"))
+          == "Heads up. The Beepies spike test run just finished.")
+    check("filled line: stopped reads 'got stopped'",
+          fill_line(DEFAULT_LINES["interrupt"], dict(APK, status="killed"))
+          == "Hold on, we're being interrupted. The agent building the "
+             "APK just got stopped.")
 
 
 def main():

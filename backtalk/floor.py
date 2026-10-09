@@ -52,6 +52,7 @@ import time
 from collections import deque
 
 from backtalk.config import CFG
+from backtalk.jobs import job_label, spoken_name
 from backtalk.vlog import log
 
 # <<anything>> is a stage direction: lifted out, never spoken, published on
@@ -152,30 +153,14 @@ DEFAULT_LINES = {
     "rest_on_screen": "The rest is on the screen.",
 }
 _STATUS = {"completed": "finished", "failed": "failed",
-           "stopped": "was stopped", "killed": "was stopped"}
+           "stopped": "got stopped", "killed": "got stopped"}
 
 
 def describe_task(info) -> str:
-    """'the build-the-APK agent', 'the test-suite job', or 'Something'.
-    Paths and backticks are removed and it is at most 8 words, because it
-    is about to be said out loud."""
-    if not info:
-        return "Something"
-    desc = str(info.get("description") or "").replace("`", "")
-    words = [w for w in desc.split() if "/" not in w and "\\" not in w]
-    words = [re.sub(r"[^\w'+-]", "", w) for w in words]
-    words = [w for w in words if w][:8]
-    if not words:
-        return "Something"
-    words = [w if (len(w) > 1 and w.isupper()) else w.lower() for w in words]
-    typ = str(info.get("type") or "").lower()
-    if "agent" in typ or "teammate" in typ:
-        noun = "agent"
-    elif "bash" in typ or "shell" in typ:
-        noun = "job"
-    else:
-        noun = "task"
-    return f"the {'-'.join(words)} {noun}"
+    """The job as the subject of a spoken line: 'the agent building the
+    APK', 'the Beepies spike test run', or 'Something' (backtalk/jobs.py).
+    No paths, no backticks, no hyphen chains: it is about to be said."""
+    return spoken_name(info)
 
 
 def status_word(info) -> str:
@@ -239,7 +224,9 @@ class _Bg:
 
     @property
     def what(self):
-        return describe_task(self.info)
+        """The job's short label ('Build the APK'): the log line and the
+        .voice_unspoken "what" field. Spoken lines use describe_task."""
+        return job_label(self.info)
 
 
 class Floor:

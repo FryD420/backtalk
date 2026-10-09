@@ -474,6 +474,8 @@ async def t_tasks():
     check("tasks: the woken turn knows what woke it",
           len(opens) == 1 and opens[0].info
           and opens[0].info["description"] == "Build the APK")
+    check("tasks: every job carries one short label (log, floor, face)",
+          opens and opens[0].info.get("label") == "Build the APK")
     check("tasks: a task reported twice is announced once",
           len([e for e in evs if e.kind == "task_done"]) == 1)
     await b.stop()
