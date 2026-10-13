@@ -43,6 +43,12 @@ background_speech (config): "off" writes bg text to .voice_unspoken
 and never speaks it; "idle" speaks it only when nothing else is
 playing; "interrupt" also cuts into an answer at a sentence boundary.
 
+HEARD: when a background turn's news has been spoken TO THE END (the
+turn closed, every chunk fed for it finished playing, nothing cut,
+capped or dropped), its task id goes to .voice_heard (signals.heard).
+That is how a face knows which finished agents the person has actually
+heard about. Anything less is not heard, and is never recorded.
+
 Startup lines and voice-console lines do not come through here: they
 call mouth.say directly, because they are answers the person asked for.
 """
@@ -221,6 +227,7 @@ class _Bg:
         self.rest: list[str] = []        # text after it was given up on
         self.last_text = 0.0             # when it last said something
         self.parked = False              # opened, then set aside mid-answer
+        self.fed: list = []              # mouth records of its own chunks
 
     @property
     def what(self):
@@ -231,7 +238,8 @@ class _Bg:
 
 class Floor:
     def __init__(self, mouth, brain=None, user_active=None, perm_pending=None,
-                 clock=time.monotonic, cfg=None, unspoken=None, logf=None):
+                 clock=time.monotonic, cfg=None, unspoken=None, logf=None,
+                 heard=None):
         cfg = CFG if cfg is None else cfg
         self._log = logf or log
         mode = str(cfg.get("background_speech") or "off").strip().lower()
@@ -254,6 +262,12 @@ class Floor:
             from backtalk import signals
             unspoken = signals.unspoken
         self._unspoken = unspoken
+        # Called (task_id, label) once a background turn's news has been
+        # spoken to the end. See _check_heard.
+        if heard is None:
+            from backtalk import signals
+            heard = signals.heard
+        self._heard = heard
         self.state = IDLE
         self._fg_q: deque = deque()      # (kind, text, dirs) not yet fed
         self._fg_active = False
@@ -266,6 +280,7 @@ class Floor:
         self._queue: deque = deque()     # bg turns with news, not started
         self._cur: _Bg | None = None     # the news being told
         self._fed: list[_Fed] = []
+        self._told: list[_Bg] = []      # news started, heard not yet decided
         self._stopped = False
 
     # ---- small helpers -------------------------------------------------
@@ -580,6 +595,46 @@ class Floor:
             if item is None:
                 break
             self._feed(*item)
+        self._check_heard()
+
+    def _check_heard(self):
+        """Decide, for each piece of news that started, whether it has
+        been HEARD: its turn closed, nothing of it is left to say, and
+        every chunk fed for it finished playing. A chunk that started and
+        was cut (key press, silence_playback, anything that dropped it
+        mid-play), news over the cap, and news given up on (backlog,
+        too_old, rebuild, shutdown) are never heard. A chunk pulled back
+        unstarted by yield_floor is not lost: it goes back in the turn's
+        own queue and is fed again, so it does not count against it."""
+        if not self._told:
+            return
+        keep = []
+        for b in self._told:
+            if b.dropped or b.overflow:
+                continue                 # never heard
+            if any(r.started and r.dropped and not r.finished
+                   for r in b.fed):
+                continue                 # cut mid-play: never heard
+            waiting = (not b.closed or b.chunks or b.chunker.batch
+                       or self._cur is b or b in self._queue
+                       or any(not r.finished and not r.dropped
+                              for r in b.fed))
+            if waiting:
+                keep.append(b)
+                continue
+            if any(r.finished for r in b.fed):
+                self._mark_heard(b)
+        self._told = keep
+
+    def _mark_heard(self, b: _Bg):
+        tid = (b.info or {}).get("id") if isinstance(b.info, dict) else None
+        if not tid:
+            return                       # nothing a face could match it to
+        self._log(f"[floor] heard: {b.what}")
+        try:
+            self._heard(str(tid), b.what)
+        except Exception:
+            pass
 
     def _fg_left(self):
         return bool(self._fg_q or self._fg_active or any(
@@ -605,6 +660,8 @@ class Floor:
         if rec is None:
             return
         self._fed.append(_Fed(kind, rec, text, dirs, bg))
+        if bg is not None:
+            bg.fed.append(rec)
         if kind in ("line", "prompt"):
             self._log(f"[floor] says: {text}")
         elif kind == "bg":
@@ -669,6 +726,8 @@ class Floor:
         except ValueError:
             pass
         self._cur = b
+        if b not in self._told:
+            self._told.append(b)
         b.chunks.appendleft(("line", self._line(line_key, b.info), None))
 
     def _next(self):

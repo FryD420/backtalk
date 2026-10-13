@@ -35,6 +35,12 @@ is the whole integration surface:
                       capped, background news while it was switched
                       off, left at shutdown). Appended; trimmed to the
                       newest 200 lines once it passes 256 KB
+  .voice_heard        JSON lines {ts, task_id, label} — background news
+                      that was spoken TO THE END (cut off, capped, never
+                      spoken: no line). task_id is the CLI's task id,
+                      which for a background agent is its agent id.
+                      Appended; trimmed to the newest 500 lines once it
+                      passes 64 KB
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work. The heartbeat and activity files are how a face
@@ -72,6 +78,9 @@ _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 _UNSPOKEN_FILE = os.path.join(_DIR, ".voice_unspoken")
 _UNSPOKEN_MAX_BYTES = 256 * 1024
 _UNSPOKEN_KEEP_LINES = 200
+_HEARD_FILE = os.path.join(_DIR, ".voice_heard")
+_HEARD_MAX_BYTES = 64 * 1024
+_HEARD_KEEP_LINES = 500
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -212,6 +221,40 @@ def unspoken(origin: str, reason: str, text: str, what=None,
                 lines = f.readlines()
             with open(_UNSPOKEN_FILE, "w", encoding="utf-8") as f:
                 f.writelines(lines[-_UNSPOKEN_KEEP_LINES:])
+    except Exception:
+        pass
+
+
+def heard(task_id, label=None):
+    """Record that a background task's news was heard, spoken to the end.
+
+    The floor calls this once per background turn whose every chunk
+    finished playing, with nothing cut, capped or dropped (floor.py,
+    _check_heard). A face uses it to tell news the person has heard
+    from news they have not: jarvis-gui greys a heard agent's row and
+    lets its "clear heard" button hide it, and never hides one that is
+    not in here. One JSON line each:
+
+      {ts, task_id, label}
+
+    task_id is the CLI's task id (for a background agent, its agent
+    id: the same id its transcript and its <task-notification> carry).
+    label is the job's short name (backtalk/jobs.py), or null. An empty
+    task id writes nothing. Appended, and trimmed to the newest 500
+    lines once the file passes 64 KB. Like every bus write, it never
+    raises."""
+    if not task_id:
+        return
+    try:
+        rec = {"ts": time.time(), "task_id": str(task_id),
+               "label": label if label else None}
+        with open(_HEARD_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        if os.path.getsize(_HEARD_FILE) > _HEARD_MAX_BYTES:
+            with open(_HEARD_FILE, encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(_HEARD_FILE, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_HEARD_KEEP_LINES:])
     except Exception:
         pass
 
