@@ -18,7 +18,7 @@ type into the live voice conversation instead of starting a sibling one.
 Serialization is inherited, not implemented: the loop dequeues one item
 at a time and awaits handle() before taking the next. NOTHING here may
 touch the brain directly — a parallel path re-triggers the off-by-one
-desync documented in brain.reset_turn().
+desync documented in brain.WarmBrain._read_pipe().
 
 Protocol: JSON Lines over TCP, one object per line, UTF-8.
   ->  {"text": "what's the status?"}

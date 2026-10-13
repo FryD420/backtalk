@@ -247,7 +247,7 @@ class _Ticket:
     """One prompt we sent, waiting for the CLI to take it in. FIFO: the
     echo of its own text (replay-user-messages) is what claims a turn."""
     __slots__ = ("prompt", "norm", "cmdword", "origin", "blind", "turn",
-                 "ready", "done")
+                 "ready", "done", "why")
 
     def __init__(self, prompt: str, origin: str, blind: bool):
         self.prompt = prompt
@@ -262,6 +262,10 @@ class _Ticket:
         self.turn: "Turn | None" = None
         self.ready = asyncio.Event()    # set once turn is known (or never)
         self.done = False               # the asker stopped listening
+        # why the asker stopped listening early ("superseded": the person
+        # moved on with new words; "stopped": an explicit stop). Names the
+        # .voice_unspoken reason for whatever the turn says afterwards.
+        self.why: str | None = None
 
 
 class Turn:
@@ -370,6 +374,19 @@ class WarmBrain:
         """Background tasks started and not yet finished."""
         return sum(1 for i in self._tasks.values()
                    if i.get("status") not in _TERMINAL)
+
+    @property
+    def agents_in_flight(self) -> int:
+        """Background AGENTS still running: the jobs a real interrupt
+        kills. Claude Code 2.1.294 answers client.interrupt() by killing
+        every background agent in the session (stoppedByUser), while a
+        background Bash job survives it (gate run, 2026-10-13). A task
+        whose backgrounding is unknown counts: better one confirm too
+        many than an agent lost."""
+        return sum(1 for i in self._tasks.values()
+                   if i.get("status") not in _TERMINAL
+                   and "agent" in str(i.get("type") or "")
+                   and i.get("background") is not False)
 
     # ---- lifecycle ----------------------------------------------------
 
@@ -598,7 +615,7 @@ class WarmBrain:
         COMPLETE AssistantMessages, not stream deltas, so the reader
         collects them on the command's own turn. Bounded: an unbounded
         await here would deafen the whole voice loop. On timeout the
-        turn, if one opened, is left open for the next reset_turn."""
+        turn, if one opened, is left to finish on its own."""
         await self._ensure_alive()
         tk = self._new_ticket(cmd, "cmd")
         await self._client.query(cmd)
@@ -622,30 +639,23 @@ class WarmBrain:
         t = tk.turn
         return " ".join(t.texts).strip() if t is not None else ""
 
-    async def interrupt(self):
-        """Stop OUR turn. A background turn is never interrupted: its
-        work carries on, and only its speech is silenced (floor.py)."""
-        if not self._client:
-            return
-        if self._open is not None and self._open.origin == "bg":
-            log("[brain] not interrupting: the open turn is background "
-                "work, only its speech is silenced")
-            return
-        await self._client.interrupt()
-
     async def reset_turn(self, timeout: float = 8.0):
-        """Make sure no turn of OURS is still running before the next
-        query goes out.
+        """THE ONE REAL INTERRUPT: stop a turn of OURS outright and wait
+        for it to close. Reached only from an explicit spoken or typed
+        stop (main.Turns.stop), never from talking over a reply.
 
-        THE OFF-BY-ONE BUG this used to fix by draining: the SDK has ONE
-        shared message stream and no pairing between a query and its
-        response, so a cancelled turn's leftovers used to pair with the
-        next question. The single pipe reader (_read_pipe) makes the
-        pairing explicit instead, so there is nothing left to drain.
-        What remains is courtesy to the CLI: interrupt an open fg/cmd
-        turn and wait for its ResultMessage. If it never comes the
-        session is rebuilt rather than left wedged. No-op when no turn
-        of ours is open; a background turn is left running."""
+        WHY IT IS RATIONED (2026-10-13). Claude Code answers the SDK's
+        bare interrupt by killing EVERY background agent in the session
+        (stoppedByUser), whether a turn is streaming or the CLI is idle;
+        three agents died that way in one morning, each from a talk-key
+        press. Talking over a reply now sends the new words into the open
+        turn instead (the CLI folds them in at the next tool boundary and
+        the agents live), so nothing else calls this.
+
+        It waits for the turn's ResultMessage; if that never comes the
+        session is rebuilt rather than left wedged (which also ends the
+        agents: the stop was asked for, and confirmed when any ran). No-op
+        when no turn of ours is open; a background turn is left running."""
         t = self._open
         if not self._client or t is None or t.origin == "bg":
             return
@@ -662,6 +672,22 @@ class WarmBrain:
             log("[brain] interrupted turn never closed — rebuilding the "
                 "session (conversation memory for this session resets)")
             await self._rebuild()
+
+    async def settle_turn(self, timeout: float = 30.0) -> bool:
+        """Wait, WITHOUT interrupting, for a turn of ours to finish. For
+        the voice console's slash commands, which want a quiet CLI. True
+        once no turn of ours is open; False if it is still going after
+        timeout (the caller sends anyway: the CLI queues it)."""
+        t = self._open
+        if not self._client or t is None or t.origin == "bg":
+            return True
+        try:
+            await asyncio.wait_for(t.closed.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            log(f"[brain] turn {t.id} still running after {timeout:g}s; "
+                f"sending the command anyway (no interrupt)")
+            return False
 
     async def _rebuild(self):
         await self._stop_reader()
@@ -720,6 +746,16 @@ class WarmBrain:
                 if s is None:
                     break
                 yield s
+        except asyncio.CancelledError as e:
+            # The person moved on (main.Turns cancels the reply with the
+            # reason as the message). The CLI turn is NOT interrupted: it
+            # keeps working, and what it says from here goes to
+            # .voice_unspoken under this reason (see _close).
+            # A bare cancel (no reason given) keeps the old "interrupted".
+            why = e.args[0] if e.args and isinstance(e.args[0], str) else None
+            if why and not tk.why:
+                tk.why = why
+            raise
         finally:
             tk.done = True
             signals.turn_end()
@@ -916,6 +952,9 @@ class WarmBrain:
                                 or data.get("description") or ""),
                 "type": (getattr(msg, "task_type", None)
                          or data.get("task_type")),
+                # False for a turn's own foreground tool run; None when
+                # the CLI does not say (agents_in_flight counts those)
+                "background": data.get("is_backgrounded"),
                 "status": "running"}
             # one short name for the job, shared by the log, the floor's
             # lines and .voice_unspoken (backtalk/jobs.py)
@@ -1056,9 +1095,10 @@ class WarmBrain:
                     if s is not None:
                         t.lost_text.append(s)
                 if t.lost_text:
-                    signals.unspoken(
-                        "fg", "interrupted" if reason in ("result", "folded")
-                        else reason, " ".join(t.lost_text))
+                    why = t.ticket.why or (
+                        "interrupted" if reason in ("result", "folded")
+                        else reason)
+                    signals.unspoken("fg", why, " ".join(t.lost_text))
             t.sentences.put_nowait(None)
         elif t.origin == "bg":
             self._emit(BgEvent(BgEvent.TURN_CLOSE, t.id, info=t.info,

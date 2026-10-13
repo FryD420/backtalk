@@ -358,14 +358,18 @@ class Floor:
     # ---- the person takes the floor ------------------------------------
 
     def _bg_reason(self, reason):
-        return "silenced" if reason == "interrupted" else reason
+        # the person taking the floor silences news; it never "supersedes"
+        # or "stops" a background turn, which carries on regardless
+        return ("silenced" if reason in ("interrupted", "superseded",
+                                         "stopped") else reason)
 
     def silence(self, reason="interrupted"):
-        """The person interrupted (key press, typed line, inbox line), or
-        we are hanging up. Everything stops at once; nothing vanishes:
-        what was cut goes to .voice_unspoken. A background CLI turn is
-        NOT interrupted (its work carries on) — the rest of its words go
-        to the file with reason 'silenced'."""
+        """The person took the floor (key press, typed line, inbox line,
+        barge-in: reason 'superseded'), said stop ('stopped'), or we are
+        hanging up. Everything stops at once; nothing vanishes: what was
+        cut goes to .voice_unspoken under the reason. This is the speaker
+        only: no CLI turn is interrupted here, fg or bg. A background
+        turn's remaining words go to the file as 'silenced'."""
         live = self._live()
         self.mouth.shut_up()
         self._fed = []

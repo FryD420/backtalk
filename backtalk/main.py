@@ -23,7 +23,14 @@ they complete (~1-2s to first audio on warm turns). The greeting plays
 over a hidden warmup query so the first real turn is already hot.
 
 Typing in this terminal is a first-class turn too: same conversation,
-spoken reply, and typing while it talks interrupts it.
+spoken reply, and typing while it talks cuts the speech off and folds
+your words into the turn it is working on.
+
+TALKING OVER IT NEVER KILLS BACKGROUND WORK: the key, a typed or inbox
+line, or a barge-in mutes the speaker and sends your words into the
+open turn. The one real interrupt is "stop" (or "stop that", "cancel
+that", "never mind") said alone, and with background agents running it
+asks you to say stop again first (see Turns).
 
 THE VOICE CONSOLE: exact phrases, spoken (or typed) alone, control the
 session itself so you never go back to the keyboard: "clear the
@@ -43,11 +50,11 @@ Flags:
                "push to talk mode"). Know the tradeoff: room audio (a
                video, music, another voice assistant) can trigger
                replies to speech never meant for the agent. The talk
-               key keeps working: it interrupts, and holding it always
-               gets you heard.
+               key keeps working: it cuts the speech off, and holding
+               it always gets you heard.
   --barge-in   with --open-mic: keep listening WHILE speaking.
                HEADPHONES REQUIRED — with open speakers the mic hears
-               the reply and the agent interrupts itself.
+               the reply and the agent talks over itself.
   --model X    override the model for this session (full id).
 
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
@@ -91,7 +98,7 @@ PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
          "hinted": False}                # escape-hatch hint said yet?
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
-_INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
+_INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: spoken over, or stopped
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
 # a live switch INTO bypassPermissions unless it was launched with the
 # danger flag, so instead the gate below auto-approves silently while
@@ -107,8 +114,8 @@ _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 _AUTOAPPROVE = {"on": False}
 # The microphone mode, switchable live by voice. "ptt" = mic closed
 # except while the key is held. "open" = hands-free listening (VAD).
-# The key keeps working in open mode: it interrupts, and holding it
-# always gets you heard. gen bumps on every switch so an in-flight
+# The key keeps working in open mode: it cuts the speech off, and
+# holding it always gets you heard. gen bumps on every switch so an in-flight
 # open-mic capture from before the switch gets discarded, never
 # processed.
 _MIC = {"mode": "ptt", "gen": 0, "btn": False}
@@ -142,10 +149,10 @@ def _norm_speech(text):
 
 
 def _deny_pending(reason=_INTERRUPT_ANSWER):
-    """Resolve a pending spoken ask as a deny. Called whenever the turn
-    that posed it is being interrupted, so the ask can never outlive its
-    turn and hijack a later utterance (or stall reset_turn waiting on
-    its turn)."""
+    """Resolve a pending spoken ask as a deny. Called whenever the
+    person talks over the reply that posed it (or stops it), so the ask
+    can never outlive its reply and hijack a later utterance (or stall
+    reset_turn waiting on its turn)."""
     f = _PERM["fut"]
     if f is not None and not f.done():
         f.set_result(reason)
@@ -292,8 +299,8 @@ def make_permission_gate(floor):
             log("[perm]   turn interrupted, denied silently")
             return PermissionResultDeny(
                 behavior="deny",
-                message="Interrupted by the user; the turn is being "
-                        "cancelled.",
+                message="Not approved: the user spoke over this "
+                        "question before answering it.",
                 interrupt=False)
         approved = _norm_speech(answer) in _YES
         # the model keeps working either way: restore the working state
@@ -351,6 +358,10 @@ CONSOLE_VERBS = {
                   "ask for permission again"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# verbs that send the CLI a slash command (or swap the session); the rest
+# are backtalk's own switches and never wait on the CLI
+_CLI_VERBS = frozenset({"clear", "reattach", "compact", "deep", "fast"}
+                       | {f"effort:{lvl}" for lvl in _EFFORTS})
 
 # Spoken in place of the silent warmup ping when a launch reattached to
 # the previous conversation (config: resume_last_session).
@@ -630,14 +641,154 @@ async def speak_reply(brain: WarmBrain, floor: Floor, text: str):
             signals.static_stop()
             signals.set_state("idle")
     except asyncio.CancelledError:
-        try:
-            await brain.interrupt()
-        except Exception:
-            pass
+        # The person took the floor. This stops LISTENING, never the CLI
+        # turn: an SDK interrupt here killed every background agent
+        # (2026-10-13). ask_stream files whatever the turn still says
+        # under the cancel's reason; Turns.stop is the only interrupt.
         raise
     finally:
         # stale-token safe: after a silence() this is a no-op
         floor.fg_done(token)
+
+
+# ---- TALKING OVER A REPLY NEVER KILLS THE BACKGROUND AGENTS.
+# Claude Code answers the SDK's bare interrupt by killing EVERY background
+# agent in the session (stoppedByUser), streaming turn or idle CLI alike.
+# On 2026-10-13 three agents died that way, each from a talk-key press or
+# a typed line while the agent was busy. A gate run against the real CLI
+# the same day: a second query() sent mid-turn is folded in at the next
+# tool boundary and the background agent finishes; interrupt() kills it
+# at once. So a takeover only silences the speaker and sends the words
+# into the open turn, and the ONE real interrupt is an explicit stop
+# phrase said alone, confirmed out loud when agents are running.
+STOP_PHRASES = frozenset({"stop", "stop that", "stop it", "stop stop",
+                          "cancel", "cancel that", "never mind",
+                          "nevermind"})
+STOP_CONFIRM_S = 15      # the second "stop" must land inside this window
+
+
+def is_stop_phrase(text) -> bool:
+    """Exact match after normalization, spoken (or typed) ALONE: "stop
+    the build" and "stop asking for permission" are not stops."""
+    return _norm_speech(text or "") in STOP_PHRASES
+
+
+class Turns:
+    """Owns the reply in progress and decides what a new utterance does
+    to it. Pure glue over the brain, the floor and the mouth, so the whole
+    takeover path runs in a test with the fake CLI (amain's handle() and
+    key press call into it; nothing here reads the microphone)."""
+
+    def __init__(self, brain, floor, mouth, clock=time.monotonic, logf=None):
+        self.brain = brain
+        self.floor = floor
+        self.mouth = mouth
+        self._clock = clock
+        self._log = logf or log
+        self.speak_task: asyncio.Task | None = None
+        self._stop_at: float | None = None   # a stop waiting for confirm
+
+    @property
+    def busy(self) -> bool:
+        return self.speak_task is not None and not self.speak_task.done()
+
+    def press(self, perm_wait: bool):
+        """The talk key went down. During a permission question the turn
+        stays alive and only playback stops (the press is the answer
+        being recorded). Otherwise the speaker goes quiet at once, news
+        included, and we stop LISTENING to the reply; the CLI turn keeps
+        working, and whatever it says next is filed as superseded."""
+        if perm_wait:
+            self.floor.silence_playback()
+            return
+        if self.busy:
+            self._log("[turn] key pressed mid-reply — muted; the turn "
+                      "keeps running (no interrupt)")
+            self.speak_task.cancel("superseded")
+        self.floor.silence("superseded")
+
+    async def takeover(self, reason="superseded"):
+        """New input arrived: silence the reply (and any news), stop
+        listening to it, and let the cancellation land before anything
+        else touches the brain. Never interrupts the CLI."""
+        if self.busy:
+            self._log("[turn] new input mid-reply — muted; the words go "
+                      "into the open turn (no interrupt)")
+            _deny_pending()          # an ask never outlives its reply
+            self.speak_task.cancel(reason)
+            self.floor.silence(reason)
+        elif self.floor.active():
+            # background news (or the tail of a finished reply) playing
+            self._log("[turn] speech silenced by new input")
+            self.floor.silence(reason)
+        if self.speak_task:
+            try:
+                await self.speak_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.speak_task = None
+
+    def ask(self, text):
+        """Send text as a question and speak its answer. If a turn of
+        ours is still running (the person talked over it), the CLI folds
+        the question into it; the pipe reader pairs the answer by the
+        CLI's echo of the question, so nothing is drained or reset."""
+        signals.set_state("thinking")
+        signals.static_start()
+        signals.turn_begin()     # .voice_activity: the turn clock starts
+        self.speak_task = asyncio.create_task(
+            speak_reply(self.brain, self.floor, text))
+
+    async def stop(self) -> str:
+        """An explicit stop. Always mutes. Interrupts only a turn of ours
+        that is actually running, and when background agents would die
+        with it, only on a second stop inside STOP_CONFIRM_S. Returns
+        "muted", "asked" or "interrupted"."""
+        await self.takeover("stopped")
+        if self.brain.open_origin not in ("fg", "cmd"):
+            # nothing of ours is running: an interrupt here could only
+            # kill background agents (2026-10-13, 11:11:10)
+            self._stop_at = None
+            self._log("[turn] stop: muted (no turn of ours running)")
+            signals.set_state("idle")
+            return "muted"
+        n = self.brain.agents_in_flight
+        now = self._clock()
+        confirmed = (self._stop_at is not None
+                     and now - self._stop_at <= STOP_CONFIRM_S)
+        if n and not confirmed:
+            self._stop_at = now
+            self._log(f"[turn] stop: asking first ({n} background "
+                      f"agent{'s' if n != 1 else ''} running)")
+            self.mouth.say(f"That will stop {n} background "
+                           f"job{'s' if n != 1 else ''}. Say stop again "
+                           f"to confirm.")
+            return "asked"
+        self._stop_at = None
+        self._log("[turn] stop: interrupting the turn"
+                  + (f" ({n} background agents go with it)" if n else ""))
+        await self.brain.reset_turn()
+        signals.set_state("idle")
+        return "interrupted"
+
+    async def submit(self, text, verb, run_console) -> str:
+        """Everything handle() does after the permission, confirm and
+        quit routing. Returns the stop outcome ("muted", "asked",
+        "interrupted"), "console" or "sent"."""
+        if verb is None and is_stop_phrase(text):
+            _deny_pending()
+            return await self.stop()
+        self._stop_at = None     # anything else said voids a pending stop
+        await self.takeover("superseded")
+        verb = verb or console_match(text)
+        if verb:
+            await run_console(verb)
+            return "console"
+        # A gate that fired while the old reply wound down never gets
+        # its answer from these words: it resolves as a deny first.
+        _deny_pending()
+        self.ask(text)
+        return "sent"
 
 
 async def amain():
@@ -798,17 +949,18 @@ async def amain():
     elif boot_effort:
         log(f"[backtalk] ignoring unknown effort {boot_effort!r} in config")
 
-    speak_task: asyncio.Task | None = None
+    turns = Turns(brain, floor, mouth)
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     inbox.start(typed_q, CFG.get("inbox_port", 0), log=log)
     typed_fut: asyncio.Future | None = None
 
     async def run_console(verb):
-        """One voice-console verb. The current reply was already
-        cancelled and awaited by handle(); reset_turn makes sure no turn
-        of ours is running before the command goes out. A verb that
-        blows up must never take the whole voice session down with it."""
+        """One voice-console verb. The current reply was already muted
+        and awaited by Turns.submit; a slash-command verb waits (never
+        interrupts) for a turn of ours to finish before it goes out. A
+        verb that blows up must never take the whole voice session down
+        with it."""
         try:
             await _run_console_inner(verb)
         except Exception as e:
@@ -818,7 +970,11 @@ async def amain():
 
     async def _run_console_inner(verb):
         _deny_pending()
-        await brain.reset_turn()
+        if verb in _CLI_VERBS:
+            # a slash command wants a quiet CLI: wait for a turn of ours
+            # to finish, never interrupt it (an interrupt kills every
+            # background agent); the CLI queues it if it runs long
+            await brain.settle_turn()
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
@@ -983,7 +1139,6 @@ async def amain():
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
         told apart from speech that began before the ask even existed."""
-        nonlocal speak_task
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
         # that utterance started after the ask was posed. Speech that
@@ -1020,52 +1175,18 @@ async def amain():
                 mouth.say("Staying as we are.")
                 return True
         if any(q in text.lower() for q in QUIT_PHRASES):
-            if speak_task and not speak_task.done():
-                speak_task.cancel()
+            if turns.busy:
+                turns.speak_task.cancel("shutdown")
             # held and queued text goes to .voice_unspoken ("shutdown")
             # before the sign-off line, and no news may follow it
             floor.shutdown()
             mouth.say(CFG["signoff"])
             mouth.wait_done(timeout=15)
             return False
-        if speak_task and not speak_task.done():
-            log("[turn] interrupted mid-reply by new input")
-            _deny_pending()          # an ask never outlives its turn
-            speak_task.cancel()
-            floor.silence("interrupted")
-        elif floor.active():
-            # background news playing: a typed or inbox line interrupts
-            # it like any reply (its CLI turn is left running)
-            log("[turn] news interrupted by new input")
-            floor.silence("interrupted")
-        if speak_task:
-            # Let the cancellation fully land (its brain.interrupt()
-            # included) BEFORE anything else touches the brain —
-            # otherwise the dead turn's stop signal can race in after
-            # the new query and kill the new answer (half of the
-            # off-by-one bug; see brain.reset_turn for the other half).
-            try:
-                await speak_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-            speak_task = None
-        verb = verb or console_match(text)
-        if verb:
-            await run_console(verb)
-            return True
-        signals.set_state("thinking")
-        signals.static_start()
-        signals.turn_begin()     # .voice_activity: the turn clock starts
-        # Make sure no turn of OURS is still running (the pipe reader
-        # pairs answers to questions, so there is nothing to drain). A
-        # gate that fired in the meantime resolves first, or the wait
-        # would be on a ResultMessage the CLI is withholding for an
-        # answer. A background turn is left running.
-        _deny_pending()
-        await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, floor, text))
+        # Everything else: an explicit stop, a console verb, or words for
+        # the agent. Talking over a reply mutes it and sends the words
+        # into the open turn; it never interrupts the CLI (Turns).
+        await turns.submit(text, verb, run_console)
         return True
 
     try:
@@ -1144,17 +1265,12 @@ async def amain():
                 press_t = time.monotonic()
                 perm_wait = (_PERM["fut"] is not None
                              and not _PERM["fut"].done())
-                if speak_task and not speak_task.done() and not perm_wait:
-                    log("[turn] interrupted mid-reply — key pressed")
-                    speak_task.cancel()          # the button = interrupt
-                # During a permission ask the TURN stays alive; the
-                # press only silences playback and records the answer.
-                # Otherwise the press silences everything, news included
-                # (what was cut goes to .voice_unspoken).
-                if perm_wait:
-                    floor.silence_playback()
-                else:
-                    floor.silence("interrupted")
+                # The button mutes; it never interrupts the CLI turn
+                # (that killed every background agent). During a
+                # permission ask only playback stops and the press
+                # records the answer; otherwise everything goes quiet,
+                # news included (what was cut goes to .voice_unspoken).
+                turns.press(perm_wait)
                 signals.static_stop()            # button kills the static too
                 signals.set_state("listening")
                 mouth.ducker.speech_start()      # duck NOW, while you talk
@@ -1191,8 +1307,8 @@ async def amain():
         pass
     finally:
         _MIC["gen"] += 1     # abort any live open-mic capture promptly
-        if speak_task and not speak_task.done():
-            speak_task.cancel()
+        if turns.busy:
+            turns.speak_task.cancel("shutdown")
         floor.shutdown()  # held/queued text -> .voice_unspoken ("shutdown")
         if floor_task is not None:
             floor_task.cancel()

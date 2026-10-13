@@ -424,7 +424,8 @@ def t_park():
 
 def t_speak_reply():
     """main.speak_reply drives the floor: chunks in, fg_done at the end,
-    and the cancel path still interrupts the brain."""
+    and a cancel stops LISTENING only: it never interrupts the brain
+    (an SDK interrupt kills every background agent, 2026-10-13)."""
     import backtalk.main as main
     main.signals.static_stop = lambda: None
     main.signals.set_state = lambda s: None
@@ -467,8 +468,8 @@ def t_speak_reply():
             await task
         except asyncio.CancelledError:
             pass
-        check("speak_reply: a cancel still interrupts the brain",
-              Brain.interrupts == 1)
+        check("speak_reply: a cancel never interrupts the brain",
+              Brain.interrupts == 0)
         check("speak_reply: the cut reply is filed, nothing left queued",
               r.file.records and r.file.records[0]["partial"]
               and r.mouth.queue == [] and r.floor.state == IDLE)
