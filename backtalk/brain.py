@@ -424,7 +424,10 @@ class WarmBrain:
                 # IT IN, including when it folds one into a running turn
                 # (confirmed live, 2026-10-08). That echo is what ties an
                 # answer to its question; see _read_pipe.
-                extra_args={"replay-user-messages": None},
+                # "chrome": Claude in Chrome, so Jarvis can drive Joe's
+                # browser (fill forms) once the extension is connected
+                # (Joe, 2026-10-25).
+                extra_args={"replay-user-messages": None, "chrome": None},
             )
         if resume:
             try:
